@@ -45,7 +45,7 @@ def fetch(session, url):
     headers = {"User-Agent": random.choice(USER_AGENTS)}
     try:
         return session.get(url, headers=headers, timeout=TIMEOUT, allow_redirects=True)
-    except requests.RequestException as exc:
+    except Exception as exc:
         return exc
 
 
@@ -61,7 +61,7 @@ def check_only(session, url):
             resp = session.get(url, headers=headers, timeout=TIMEOUT, allow_redirects=True, stream=True)
             resp.close()
         return resp
-    except requests.RequestException as exc:
+    except Exception as exc:
         return exc
 
 

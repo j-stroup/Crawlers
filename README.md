@@ -92,6 +92,10 @@ python deep_audit.py https://example.com --delay-min 1 --delay-max 3 --proxy htt
 
 # Rotate through a list of proxies (one per line, file passed via --proxy-file)
 python deep_audit.py https://example.com --proxy-file proxies.txt
+
+# A site with years of near-identical archive pages (e.g. /bids/...) -
+# only fully crawl the first 50 pages under each top-level path
+python deep_audit.py https://example.com --max-per-path-prefix 50
 ```
 
 `--max-pages` defaults to 5000 as a safety valve across the whole run
@@ -100,6 +104,29 @@ want it to run until the queue is empty.
 
 Writes one `{domain}.txt` per site into `--output-dir` (default
 `./reports/`).
+
+**Crash safety.** For a run that's going to take hours, losing
+everything to a crash, a killed terminal, or a dropped remote session
+would be a waste of an afternoon. Every `--checkpoint-interval` seconds
+(default 120, `0` disables) each site's report is rewritten to disk
+mid-crawl with a `*** PARTIAL / IN-PROGRESS ***` banner at the top. The
+final write at the end of a clean run replaces that banner with the
+finished report. Worst case if something dies mid-run, you lose the last
+checkpoint interval of findings, not the whole audit.
+
+**Repeated/archive endpoints.** Some sites have huge flat archives of
+structurally identical pages - years of `/bids/...` postings, thousands
+of blog posts under `/blog/...` - that rarely turn up anything new and
+just make a long crawl longer. `--max-per-path-prefix N` caps how many
+pages get *fully crawled* under the same leading path segment(s)
+(`--path-prefix-depth`, default 1, controls how many segments count as
+the "same bucket" - e.g. depth 1 buckets everything under `/bids/`
+together regardless of year). Pages beyond the cap are skipped outright
+(not fetched at all); the report notes how many were skipped per site so
+you know the number is being capped, not that the site only has that
+many pages. Off by default (`0`) since it's easy to accidentally skip
+something real on a smaller site - turn it on for the specific
+large-archive sites where you know it applies.
 
 ## Notes
 

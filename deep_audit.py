@@ -14,11 +14,20 @@ get fully crawled. External links (when not --allow-external) and any
 <img>/<link rel=stylesheet|icon>/<iframe>/external <script> resource get
 a status check but are never crawled further.
 
+Report files are checkpointed periodically during the crawl (not just at
+the end), so an hours-long run that gets killed or crashes still leaves
+a usable (if slightly stale) report instead of nothing. Path-prefix
+bucketing (--max-per-path-prefix) caps how many pages get fully crawled
+under the same leading path segment(s), so a giant flat archive (years
+of /bids/... postings, thousands of near-identical blog posts) doesn't
+eat the whole run on pages that are all going to look the same.
+
 Examples:
     python deep_audit.py https://example.com
     python deep_audit.py https://example.com https://other-site.com --threads 15
     python deep_audit.py https://example.com --allow-external --max-pages 20000
     python deep_audit.py https://example.com --ignore-robots --proxy http://127.0.0.1:8080
+    python deep_audit.py https://example.com --max-per-path-prefix 50
 """
 
 import argparse
@@ -134,6 +143,7 @@ class SiteFindings:
         self.netloc = netloc
         self.pages_crawled = 0
         self.robots_blocked = 0
+        self.pattern_skipped = 0
         self.broken = []             # (url, status_or_error, found_on)
         self.broken_resources = []   # (url, status_or_error, found_on, kind)
         self.security_codes = []     # (url, status, found_on)
@@ -146,6 +156,27 @@ class SiteFindings:
         self.header_checked_url = None
         self.missing_security_headers = []
         self.lock = threading.Lock()
+
+    def snapshot(self):
+        """A point-in-time copy, safe to write to disk while other
+        threads keep appending to the live findings (checkpointing)."""
+        with self.lock:
+            copy = SiteFindings(self.netloc)
+            copy.pages_crawled = self.pages_crawled
+            copy.robots_blocked = self.robots_blocked
+            copy.pattern_skipped = self.pattern_skipped
+            copy.broken = list(self.broken)
+            copy.broken_resources = list(self.broken_resources)
+            copy.security_codes = list(self.security_codes)
+            copy.directory_listings = list(self.directory_listings)
+            copy.legacy_files = list(self.legacy_files)
+            copy.sensitive_files = list(self.sensitive_files)
+            copy.risky_params = list(self.risky_params)
+            copy.secrets = list(self.secrets)
+            copy.header_check_done = self.header_check_done
+            copy.header_checked_url = self.header_checked_url
+            copy.missing_security_headers = list(self.missing_security_headers)
+            return copy
 
 
 # --------------------------------------------------------------------------
@@ -207,6 +238,16 @@ class Context:
         self.processed_count = 0
         self.count_lock = threading.Lock()
 
+        # Path-prefix bucket cap - keeps a site with a huge flat archive
+        # (years of /bids/... postings, thousands of near-identical blog
+        # posts, etc.) from eating the whole run on pages that are all
+        # going to look the same.
+        self.max_per_prefix = args.max_per_path_prefix
+        self.prefix_depth = args.path_prefix_depth
+        self.prefix_counts = {}
+        self.prefix_announced = set()
+        self.prefix_lock = threading.Lock()
+
     @staticmethod
     def _load_proxies(proxy, proxy_file):
         proxies = []
@@ -238,19 +279,45 @@ class Context:
 
     def should_enqueue(self, link, respect_domain=True):
         """respect_domain=True is for pages we're going to fully crawl
-        (obeys --allow-external / seed-domain scoping). respect_domain=
-        False is for leaf checks - resources and external links - which
-        get a status check wherever they point, but are never crawled
-        further, so the scoping restriction doesn't apply to them."""
+        (obeys --allow-external / seed-domain scoping, and the
+        path-prefix bucket cap). respect_domain=False is for leaf checks
+        - resources and external links - which get a status check
+        wherever they point, but are never crawled further, so neither
+        restriction applies to them."""
         if respect_domain and not self.allow_external:
             if urlparse(link).netloc not in self.seed_netlocs:
                 return False
+        if respect_domain and not self._allow_by_prefix(link):
+            return False
         with self.visited_lock:
             if link in self.visited:
                 return False
             if self.max_pages and len(self.visited) >= self.max_pages:
                 return False
             self.visited.add(link)
+            return True
+
+    def _allow_by_prefix(self, link):
+        if not self.max_per_prefix:
+            return True
+        parsed = urlparse(link)
+        segments = [s for s in parsed.path.split("/") if s]
+        prefix = "/".join(segments[:self.prefix_depth])
+        if not prefix:
+            return True  # homepage / root - never bucket-limited
+        key = (parsed.netloc, prefix)
+        with self.prefix_lock:
+            count = self.prefix_counts.get(key, 0)
+            if count >= self.max_per_prefix:
+                if key not in self.prefix_announced:
+                    self.prefix_announced.add(key)
+                    print(f"  [PATTERN LIMIT] /{prefix} on {parsed.netloc} reached "
+                          f"{self.max_per_prefix} pages crawled - skipping further matches")
+                findings = self.findings_for(parsed.netloc)
+                with findings.lock:
+                    findings.pattern_skipped += 1
+                return False
+            self.prefix_counts[key] = count + 1
             return True
 
     def bump_progress(self):
@@ -306,7 +373,7 @@ def check_only(ctx, url):
                                 allow_redirects=True, stream=True)
             resp.close()
         return resp
-    except requests.RequestException as exc:
+    except Exception as exc:
         return exc
 
 
@@ -411,7 +478,7 @@ def process_url(ctx, url, found_on):
             url, headers=headers, timeout=ctx.timeout,
             proxies=proxies, allow_redirects=True,
         )
-    except requests.RequestException as exc:
+    except Exception as exc:
         with findings.lock:
             findings.broken.append((url, f"ERROR: {exc}", found_on))
         print(f"  [ERROR] {url} -> {exc}")
@@ -527,17 +594,22 @@ def _write_section(f, title, rows, formatter):
     f.write("\n")
 
 
-def write_report(findings, elapsed, outdir, args):
+def write_report(findings, elapsed, outdir, args, partial=False):
     name = site_name(findings.netloc)
     path = Path(outdir) / f"{name}.txt"
     path.parent.mkdir(parents=True, exist_ok=True)
 
     with path.open("w", encoding="utf-8") as f:
         f.write(f"Deep Dive Audit Report - {findings.netloc}\n")
+        if partial:
+            f.write("*** PARTIAL / IN-PROGRESS CHECKPOINT - crawl was still running when this was written ***\n")
         f.write(f"Generated: {datetime.now().isoformat(timespec='seconds')}\n")
         f.write(f"Pages crawled: {findings.pages_crawled}\n")
         f.write(f"Robots.txt blocked: {findings.robots_blocked}"
                 f"{' (robots.txt ignored)' if args.ignore_robots else ''}\n")
+        if args.max_per_path_prefix:
+            f.write(f"Skipped by path-prefix limit (--max-per-path-prefix {args.max_per_path_prefix}): "
+                    f"{findings.pattern_skipped}\n")
         f.write(f"Duration: {elapsed:.1f}s\n")
         f.write("=" * 70 + "\n\n")
 
@@ -589,6 +661,25 @@ def write_report(findings, elapsed, outdir, args):
     return path
 
 
+def checkpoint_writer(ctx, args, started, interval, stop_event):
+    """Periodically writes every site's current findings to disk so a
+    crash, a killed terminal, or a lost remote session after hours of
+    crawling doesn't throw away everything - worst case you lose the
+    last `interval` seconds of progress, not the whole run."""
+    while not stop_event.wait(interval):
+        with ctx.findings_lock:
+            sites = list(ctx.findings.items())
+        if not sites:
+            continue
+        elapsed = time.time() - started
+        for netloc, findings in sites:
+            try:
+                write_report(findings.snapshot(), elapsed, args.output_dir, args, partial=True)
+            except Exception as exc:
+                print(f"  [CHECKPOINT ERROR] {netloc}: {exc}")
+        print(f"  [CHECKPOINT] wrote {len(sites)} report(s) to {args.output_dir}")
+
+
 # --------------------------------------------------------------------------
 # Main
 # --------------------------------------------------------------------------
@@ -613,6 +704,17 @@ def main():
     parser.add_argument("--proxy", default=None, help="Single proxy URL, e.g. http://user:pass@host:port")
     parser.add_argument("--proxy-file", default=None, help="File with one proxy URL per line, rotated randomly per request")
     parser.add_argument("--output-dir", default="reports", help="Directory to write report files into (default: ./reports)")
+    parser.add_argument("--checkpoint-interval", type=float, default=120,
+                         help="Seconds between periodic report checkpoints during the crawl, so a crash or a "
+                              "killed session doesn't lose everything (0 disables, default 120)")
+    parser.add_argument("--max-per-path-prefix", type=int, default=0,
+                         help="Cap on how many pages get fully crawled under the same path prefix, e.g. "
+                              "/bids/... with years of near-identical postings (0 = unlimited/disabled). "
+                              "Pages beyond the cap are skipped, not fetched - resources/links on pages "
+                              "already crawled are still checked normally.")
+    parser.add_argument("--path-prefix-depth", type=int, default=1,
+                         help="Number of leading path segments that define a bucket for "
+                              "--max-per-path-prefix (default 1, e.g. '/bids' regardless of what follows it)")
     args = parser.parse_args()
 
     seeds = [normalize_seed(u) for u in args.urls]
@@ -635,14 +737,30 @@ def main():
     for t in threads:
         t.start()
 
+    checkpoint_stop = threading.Event()
+    checkpoint_thread = None
+    if args.checkpoint_interval:
+        checkpoint_thread = threading.Thread(
+            target=checkpoint_writer,
+            args=(ctx, args, started, args.checkpoint_interval, checkpoint_stop),
+            daemon=True,
+        )
+        checkpoint_thread.start()
+        print(f"Checkpointing partial reports every {args.checkpoint_interval:.0f}s to {args.output_dir}")
+
     try:
         ctx.queue.join()
     except KeyboardInterrupt:
         print("\nInterrupted - writing reports for progress made so far...")
+    except Exception as exc:
+        print(f"\nUnexpected error ({exc}) - writing reports for progress made so far...")
     finally:
         ctx.stop_event.set()
         for t in threads:
             t.join(timeout=2)
+        checkpoint_stop.set()
+        if checkpoint_thread:
+            checkpoint_thread.join(timeout=2)
 
     elapsed = time.time() - started
 
@@ -654,7 +772,8 @@ def main():
               f"{len(findings.broken)} broken, {len(findings.broken_resources)} broken resources, "
               f"{len(findings.security_codes)} security-watch, {len(findings.directory_listings)} dir listings, "
               f"{len(findings.legacy_files)} legacy files, {len(findings.sensitive_files)} sensitive files, "
-              f"{len(findings.risky_params)} risky params, {len(findings.secrets)} possible secrets "
+              f"{len(findings.risky_params)} risky params, {len(findings.secrets)} possible secrets, "
+              f"{findings.pattern_skipped} skipped by path-prefix limit "
               f"-> {path}")
 
 
