@@ -32,8 +32,16 @@ FLAGGED_EXTENSIONS = (".pdf", ".txt", ".doc", ".docx")
 TIMEOUT = 10
 
 
+def normalize_netloc(netloc):
+    """'www.example.com' and 'example.com' are the same site - strip a
+    leading 'www.' before comparing so the crawler doesn't treat one as
+    external just because a link happens to use the other."""
+    netloc = netloc.lower()
+    return netloc[4:] if netloc.startswith("www.") else netloc
+
+
 def same_domain(url, netloc):
-    return urlparse(url).netloc == netloc
+    return normalize_netloc(urlparse(url).netloc) == normalize_netloc(netloc)
 
 
 def site_name(start_url):

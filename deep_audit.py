@@ -126,8 +126,17 @@ def mask(secret):
     return f"{secret[:4]}{'*' * (len(secret) - 8)}{secret[-4:]}"
 
 
+def normalize_netloc(netloc):
+    """'www.example.com' and 'example.com' are the same site - strip a
+    leading 'www.' before comparing/grouping so the crawler doesn't
+    treat one as external, or split findings across two reports, just
+    because a link happens to use the other."""
+    netloc = netloc.lower()
+    return netloc[4:] if netloc.startswith("www.") else netloc
+
+
 def site_key(url):
-    return urlparse(url).netloc
+    return normalize_netloc(urlparse(url).netloc)
 
 
 def site_name(netloc):
@@ -285,7 +294,7 @@ class Context:
         wherever they point, but are never crawled further, so neither
         restriction applies to them."""
         if respect_domain and not self.allow_external:
-            if urlparse(link).netloc not in self.seed_netlocs:
+            if normalize_netloc(urlparse(link).netloc) not in self.seed_netlocs:
                 return False
         if respect_domain and not self._allow_by_prefix(link):
             return False
@@ -305,15 +314,16 @@ class Context:
         prefix = "/".join(segments[:self.prefix_depth])
         if not prefix:
             return True  # homepage / root - never bucket-limited
-        key = (parsed.netloc, prefix)
+        netloc = normalize_netloc(parsed.netloc)
+        key = (netloc, prefix)
         with self.prefix_lock:
             count = self.prefix_counts.get(key, 0)
             if count >= self.max_per_prefix:
                 if key not in self.prefix_announced:
                     self.prefix_announced.add(key)
-                    print(f"  [PATTERN LIMIT] /{prefix} on {parsed.netloc} reached "
+                    print(f"  [PATTERN LIMIT] /{prefix} on {netloc} reached "
                           f"{self.max_per_prefix} pages crawled - skipping further matches")
-                findings = self.findings_for(parsed.netloc)
+                findings = self.findings_for(netloc)
                 with findings.lock:
                     findings.pattern_skipped += 1
                 return False
@@ -424,7 +434,7 @@ def extract_links(ctx, url, soup):
         link = urljoin(url, tag["href"]).split("#")[0]
         if not link.startswith(("http://", "https://")):
             continue
-        if ctx.allow_external or urlparse(link).netloc in ctx.seed_netlocs:
+        if ctx.allow_external or normalize_netloc(urlparse(link).netloc) in ctx.seed_netlocs:
             page_links.add(link)
         else:
             resource_links.append((link, "external link"))
@@ -433,7 +443,7 @@ def extract_links(ctx, url, soup):
         link = urljoin(url, tag["src"]).split("#")[0]
         if not link.startswith(("http://", "https://")):
             continue
-        if ctx.allow_external or urlparse(link).netloc in ctx.seed_netlocs:
+        if ctx.allow_external or normalize_netloc(urlparse(link).netloc) in ctx.seed_netlocs:
             page_links.add(link)  # fetched fully so it can be secret-scanned
         else:
             resource_links.append((link, "script"))
@@ -718,7 +728,7 @@ def main():
     args = parser.parse_args()
 
     seeds = [normalize_seed(u) for u in args.urls]
-    seed_netlocs = {urlparse(u).netloc for u in seeds}
+    seed_netlocs = {normalize_netloc(urlparse(u).netloc) for u in seeds}
 
     ctx = Context(args, seed_netlocs)
     for seed in seeds:
