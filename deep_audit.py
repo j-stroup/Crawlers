@@ -46,6 +46,7 @@ import requests
 from bs4 import BeautifulSoup
 
 from user_agents import USER_AGENTS
+from report_html import make_row, write_html_report
 
 # --------------------------------------------------------------------------
 # Classification tables. Heuristic by design - the point is "flag it for a
@@ -671,6 +672,46 @@ def write_report(findings, elapsed, outdir, args, partial=False):
     return path
 
 
+def build_rows(findings):
+    rows = []
+    for url, status, found_on in findings.broken:
+        rows.append(make_row("Broken Link", status, url, found_on))
+    for url, status, found_on, kind in findings.broken_resources:
+        rows.append(make_row(f"Broken Resource ({kind})", status, url, found_on))
+    for url, status, found_on in findings.security_codes:
+        rows.append(make_row("Security Watch", status, url, found_on))
+    for url, status, found_on in findings.directory_listings:
+        rows.append(make_row("Directory Listing", status, url, found_on))
+    for header in findings.missing_security_headers:
+        rows.append(make_row("Missing Security Header", header, findings.header_checked_url))
+    for url, status, found_on in findings.legacy_files:
+        rows.append(make_row("Legacy File", status, url, found_on))
+    for url, status, found_on in findings.sensitive_files:
+        rows.append(make_row("Sensitive File", status, url, found_on))
+    for url, params, found_on in findings.risky_params:
+        rows.append(make_row("Risky Parameter", ", ".join(params), url, found_on))
+    for url, label, masked in findings.secrets:
+        rows.append(make_row("Possible Secret", f"{label}: {masked}", url))
+    return rows
+
+
+def write_html(findings, elapsed, outdir, args, partial=False):
+    rows = build_rows(findings)
+    summary_lines = [
+        ("Pages crawled", str(findings.pages_crawled)),
+        ("Robots.txt blocked", str(findings.robots_blocked)),
+    ]
+    if args.max_per_path_prefix:
+        summary_lines.append(("Skipped by path-prefix limit", str(findings.pattern_skipped)))
+    meta = {
+        "title": f"Deep Dive Audit Report - {findings.netloc}",
+        "subtitle": f"Generated {datetime.now().isoformat(timespec='seconds')} · {elapsed:.1f}s",
+        "partial": partial,
+        "summary_lines": summary_lines,
+    }
+    return write_html_report(rows, meta, outdir, site_name(findings.netloc))
+
+
 def checkpoint_writer(ctx, args, started, interval, stop_event):
     """Periodically writes every site's current findings to disk so a
     crash, a killed terminal, or a lost remote session after hours of
@@ -684,7 +725,9 @@ def checkpoint_writer(ctx, args, started, interval, stop_event):
         elapsed = time.time() - started
         for netloc, findings in sites:
             try:
-                write_report(findings.snapshot(), elapsed, args.output_dir, args, partial=True)
+                snap = findings.snapshot()
+                write_report(snap, elapsed, args.output_dir, args, partial=True)
+                write_html(snap, elapsed, args.output_dir, args, partial=True)
             except Exception as exc:
                 print(f"  [CHECKPOINT ERROR] {netloc}: {exc}")
         print(f"  [CHECKPOINT] wrote {len(sites)} report(s) to {args.output_dir}")
@@ -778,13 +821,14 @@ def main():
     print(f"Crawl finished in {elapsed:.1f}s. Writing reports...")
     for netloc, findings in ctx.findings.items():
         path = write_report(findings, elapsed, args.output_dir, args)
+        html_path = write_html(findings, elapsed, args.output_dir, args)
         print(f"  {netloc}: {findings.pages_crawled} pages, "
               f"{len(findings.broken)} broken, {len(findings.broken_resources)} broken resources, "
               f"{len(findings.security_codes)} security-watch, {len(findings.directory_listings)} dir listings, "
               f"{len(findings.legacy_files)} legacy files, {len(findings.sensitive_files)} sensitive files, "
               f"{len(findings.risky_params)} risky params, {len(findings.secrets)} possible secrets, "
               f"{findings.pattern_skipped} skipped by path-prefix limit "
-              f"-> {path}")
+              f"-> {path} / {html_path}")
 
 
 if __name__ == "__main__":

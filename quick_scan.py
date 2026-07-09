@@ -27,6 +27,7 @@ import requests
 from bs4 import BeautifulSoup
 
 from user_agents import USER_AGENTS
+from report_html import make_row, write_html_report
 
 FLAGGED_EXTENSIONS = (".pdf", ".txt", ".doc", ".docx")
 TIMEOUT = 10
@@ -219,6 +220,32 @@ def write_report(start_url, visited_pages, checked, broken, flagged, elapsed, ou
     return path
 
 
+def build_rows(broken, flagged):
+    rows = []
+    for url, status, found, kind in broken:
+        category = "Broken Link" if kind == "page" else f"Broken Resource ({kind})"
+        rows.append(make_row(category, status, url, found))
+    for url, status, found, kind in flagged:
+        rows.append(make_row(f"Flagged File ({kind})", status, url, found))
+    return rows
+
+
+def write_html(start_url, visited_pages, checked, broken, flagged, elapsed, outdir):
+    rows = build_rows(broken, flagged)
+    meta = {
+        "title": f"Quick Scan Report - {start_url}",
+        "subtitle": f"Generated {datetime.now().isoformat(timespec='seconds')} · {elapsed:.1f}s",
+        "partial": False,
+        "summary_lines": [
+            ("Pages crawled", str(len(visited_pages))),
+            ("Links/resources checked", str(len(checked))),
+            ("Broken", str(len(broken))),
+            ("Flagged files", str(len(flagged))),
+        ],
+    }
+    return write_html_report(rows, meta, outdir, site_name(start_url))
+
+
 def main():
     parser = argparse.ArgumentParser(description="Quick single-domain broken-link/legacy-file scan.")
     parser.add_argument("url", help="Starting URL, e.g. https://example.com")
@@ -236,6 +263,7 @@ def main():
     elapsed = time.time() - started
 
     report_path = write_report(start_url, visited_pages, checked, broken, flagged, elapsed, args.output_dir)
+    html_path = write_html(start_url, visited_pages, checked, broken, flagged, elapsed, args.output_dir)
 
     print()
     print(f"Pages crawled       : {len(visited_pages)}")
@@ -243,6 +271,7 @@ def main():
     print(f"Broken links/resources : {len(broken)}")
     print(f"Flagged files        : {len(flagged)}")
     print(f"Report written to {report_path}")
+    print(f"Sortable report      : {html_path}")
 
 
 if __name__ == "__main__":
