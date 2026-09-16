@@ -20,12 +20,15 @@ from pathlib import Path
 # the text reports.
 CRITICAL_CATEGORIES = {
     "Broken Link", "Broken Resource", "Security Watch",
-    "Directory Listing", "Possible Secret",
+    "Directory Listing", "Possible Secret", "Exposed Path",
 }
 WARNING_CATEGORIES = {
     "Legacy File", "Sensitive File", "Missing Security Header",
-    "Risky Parameter", "Flagged File",
+    "Risky Parameter", "Flagged File", "Mixed Content", "Cookie Flag",
 }
+# Everything else (Rate Limited, Public/Low-Confidence Key, Version
+# Disclosure, Third-Party Script, Tabnabbing Link) falls through to the
+# muted "none" severity - informational, present but not alarming.
 
 
 def severity_for(category):

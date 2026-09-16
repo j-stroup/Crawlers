@@ -49,25 +49,52 @@ else's site gets caught without spidering their whole domain.
 Finds:
 - 404/410s as broken links; 401/403/407/5xx as a separate "security-watch"
   bucket (auth issues, server errors that can leak internals)
+- 429/503 rate-limiting handled with per-host backoff + retry (see below),
+  reported as "could not verify" rather than as a broken link
 - Broken resources: dead images, stylesheets, iframes, scripts, and
   external links
 - Exposed directory listings (`Index of /...` pages - Apache/nginx/IIS
   autoindex left on)
 - Missing baseline security response headers (`Content-Security-Policy`,
   `X-Frame-Options`, `X-Content-Type-Options`, `Strict-Transport-Security`,
-  `Referrer-Policy`) - checked once per site against the first
-  successfully-loaded page, since header config is normally site-wide
+  `Referrer-Policy`) - checked once per site against the **seed/homepage**
+  (header config is normally site-wide)
 - Legacy document types (pdf/doc/docx/ppt/pptx/xls/xlsx)
-- Sensitive/data-exposure file types (`.db`, `.sql`, `.env`, `.log`, `.bak`,
-  `.json`, `.xml`, `.yml`, `.zip`, etc. - see `SENSITIVE_EXTENSIONS` in
-  the script to tune the list)
-- URLs whose query parameters look risky (`id`, `debug`, `redirect`,
-  `token`, `cmd`, `path`, etc. - see `RISKY_PARAM_NAMES` to tune)
-- Likely leaked API keys/credentials in HTML and `.js` source (AWS,
-  Google, Slack, Stripe, JWTs, private key blocks, generic
-  `api_key=`/`password=` assignments). Values are masked in the report
-  (`AKIA****************3F2A`) so the report file itself isn't a plaintext
-  secrets dump.
+- Sensitive/data-exposure file types, tiered: always-bad types (`.sql`,
+  `.env`, `.db`, `.bak`, `.key`, `.pem`, `.zip`, ...) always flag;
+  normally-benign ones (`.json`, `.xml`, `.csv`, `.txt`) flag **only** when
+  the filename itself looks like a dump (`users_export.csv`,
+  `db_backup.json`) - so `sitemap.xml` and `manifest.json` don't
+- URLs with a **dangerous parameter value** - a redirect/callback param
+  pointing at a URL (open-redirect/SSRF), a value with `../` traversal, or
+  a `debug=true`/`admin=1` toggle. Value-based, so a plain `?id=5` or
+  `?page=2` no longer trips anything
+- Leaked API keys/credentials in HTML and `.js`, **tiered by confidence**:
+  high (AWS, Slack, Stripe `sk_live`, private-key blocks), medium (raw
+  JWTs, high-entropy generic `api_key=`/`password=` assignments), and a
+  separate informational bucket for public-by-design keys (Google/Firebase
+  browser keys, Stripe publishable keys) that are *meant* to ship in the
+  page. Placeholder/example values (`your_api_key_here`, the AWS docs key)
+  and low-entropy junk (`password = "password"`) are dropped. Values are
+  masked (`AKIA****************TLPD`) so the report isn't a secrets dump.
+
+Plus a handful of cheap extra signals gathered while it's already on the
+page (no extra requests):
+- **Mixed content** - `http://` sub-resources (scripts, images, CSS,
+  iframes, form actions) loaded on an `https://` page
+- **Cookies missing security flags** - `Set-Cookie` without
+  `Secure`/`HttpOnly`/`SameSite`, reported once per cookie name
+- **Version-disclosure headers** - `Server`, `X-Powered-By`,
+  `X-AspNet-Version`, etc. that hand an attacker a version to look up
+- **Third-party script inventory** - the external hosts you're loading
+  JavaScript from (supply-chain surface), one line per host
+- **`target="_blank"` without `rel="noopener"`** - cross-origin
+  tabnabbing links
+- **Exposed common paths** (opt-in, `--probe-common-paths`) - the only
+  active check: it requests a small fixed list of things that shouldn't be
+  public (`/.git/HEAD`, `/.env`, `/backup.zip`, ...) even if nothing links
+  to them, and reports any that are reachable (or present-but-403). Off by
+  default because it fetches URLs the site never advertised.
 
 Broken-resource and external-link findings are attributed to the site
 that referenced them, not the (often third-party) domain the link points
@@ -94,8 +121,17 @@ python deep_audit.py https://example.com --delay-min 1 --delay-max 3 --proxy htt
 python deep_audit.py https://example.com --proxy-file proxies.txt
 
 # A site with years of near-identical archive pages (e.g. /bids/...) -
-# only fully crawl the first 50 pages under each top-level path
-python deep_audit.py https://example.com --max-per-path-prefix 50
+# only fully crawl the first 50 pages under each top-level path, and cap
+# calendar/faceted-search traps at 20 query variants per path
+python deep_audit.py https://example.com --max-per-path-prefix 50 --max-query-variants 20
+
+# It crashed six hours in - just run the exact same command again to resume
+python deep_audit.py https://example.com
+# ...or force a clean start, ignoring saved state
+python deep_audit.py https://example.com --fresh
+
+# Also probe for unlinked sensitive paths (.git/.env/backups) - your own site
+python deep_audit.py https://example.com --probe-common-paths
 ```
 
 `--max-pages` defaults to 5000 as a safety valve across the whole run
@@ -105,28 +141,66 @@ want it to run until the queue is empty.
 Writes one `{domain}.txt` per site into `--output-dir` (default
 `./reports/`).
 
-**Crash safety.** For a run that's going to take hours, losing
-everything to a crash, a killed terminal, or a dropped remote session
-would be a waste of an afternoon. Every `--checkpoint-interval` seconds
-(default 120, `0` disables) each site's report is rewritten to disk
-mid-crawl with a `*** PARTIAL / IN-PROGRESS ***` banner at the top. The
-final write at the end of a clean run replaces that banner with the
-finished report. Worst case if something dies mid-run, you lose the last
-checkpoint interval of findings, not the whole audit.
+**Resumable state + bounded memory (SQLite).** The crawl frontier, the
+"already seen" set, and every finding live in a SQLite file
+(`<output-dir>/.crawl_state/audit_<hash>.db` by default, or
+`--state-db PATH`), not in RAM. Two payoffs for the multi-day crawls this
+is built for:
 
-**Repeated/archive endpoints.** Some sites have huge flat archives of
-structurally identical pages - years of `/bids/...` postings, thousands
-of blog posts under `/blog/...` - that rarely turn up anything new and
-just make a long crawl longer. `--max-per-path-prefix N` caps how many
-pages get *fully crawled* under the same leading path segment(s)
-(`--path-prefix-depth`, default 1, controls how many segments count as
-the "same bucket" - e.g. depth 1 buckets everything under `/bids/`
-together regardless of year). Pages beyond the cap are skipped outright
-(not fetched at all); the report notes how many were skipped per site so
-you know the number is being capped, not that the site only has that
-many pages. Off by default (`0`) since it's easy to accidentally skip
-something real on a smaller site - turn it on for the specific
-large-archive sites where you know it applies.
+- *Resume after a crash.* If a run dies - crash, killed terminal, dropped
+  remote session, power blip - just rerun the exact same command. It
+  resets the handful of URLs that were in flight and picks the frontier
+  back up where it stopped, instead of re-crawling the whole site.
+  `--fresh` forces a clean start; a re-run of an already-*completed* crawl
+  also starts fresh automatically.
+- *Bounded memory.* Because the frontier and seen-set are on disk, the
+  process doesn't grow without limit on a million-URL site until the OS
+  kills it - historically the reason big crawls didn't finish.
+
+The `.txt`/`.html` reports are still checkpointed every
+`--checkpoint-interval` seconds (default 120, `0` disables) with a
+`*** PARTIAL / IN-PROGRESS ***` banner, so you always have a readable
+deliverable mid-crawl; the database is the durable source of truth behind
+them.
+
+**Cutting redundant crawling (no extra requests).** Three defenses stop a
+big or trap-laden site from running for days without fetching any faster:
+
+- *URL canonicalization.* Before a URL is added to the frontier it's
+  normalized - lowercased host, default port and tracking params
+  (`utm_*`, `fbclid`, `gclid`, ...) stripped, query parameters sorted - so
+  the same page linked a dozen different ways is crawled **once** instead
+  of a dozen times. (Trailing slashes are left alone, since some servers
+  really do treat `/foo` and `/foo/` as different pages.)
+- *`--max-per-path-prefix N`* caps how many pages get fully crawled under
+  the same leading path segment(s) (`--path-prefix-depth`, default 1 -
+  e.g. everything under `/bids/` counts as one bucket regardless of year).
+  For huge flat archives - years of `/bids/...` postings, thousands of
+  `/blog/...` posts - that rarely turn up anything new.
+- *`--max-query-variants N`* caps how many distinct query-string variants
+  of the same path get crawled - the classic calendar
+  (`/events?date=...` → next month forever) and faceted-search
+  (`/search?color=&size=&sort=...` → combinatorial explosion) traps.
+- *`--max-depth N`* stops following links past N hops from a seed (a seed
+  is depth 0). A blunt but effective cap on how deep a templated or
+  paginated tree is chased.
+
+All four are off by default (the caps at `0`, canonicalization is always
+on since it only removes provable duplicates). Each capped skip is
+counted per site in the report, so a low page count reads as "we capped
+it here," not "the site only had that many pages." Turn the caps on for
+the specific large or trap-prone sites where you know they apply.
+
+**Politeness / not DoS-ing the site.** Beyond the randomized per-request
+delay, the crawler watches for `429 Too Many Requests` / `503` responses.
+When a host returns one it backs that host off for a cooldown window that
+*every* thread honours (respecting a `Retry-After` header if present, else
+a doubling 2s → 60s backoff), and retries the URL up to `--max-retries`
+times (default 2). Only if it's still throttled after the retries does it
+record a finding - as "rate-limited / could not verify," never as a broken
+link. Net effect: if a site starts pushing back, the whole crawl quietly
+slows down instead of hammering it, and you don't get a report full of
+phantom "broken" links that were really just rate-limiting.
 
 ## Notes
 
