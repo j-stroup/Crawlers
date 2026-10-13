@@ -142,6 +142,28 @@ SECURITY_STATUS_CODES = {401, 403, 407, 500, 501, 502, 503, 504, 505, 507, 511}
 # than recorded as broken links.
 RATE_LIMIT_CODES = {429, 503}
 
+# Social / login-gated platforms that block crawlers by design - they
+# answer 400/403/429/999 (LinkedIn's infamous 999) to a bot regardless of
+# HEAD vs GET. A link to one of these is virtually never actually broken,
+# so we don't fetch them and don't call them broken - just note them once.
+# Add your own here if a site keeps showing up as noise.
+BOT_HOSTILE_HOSTS = {
+    "facebook.com", "fb.com", "fb.me", "fb.watch", "messenger.com",
+    "instagram.com", "threads.net",
+    "linkedin.com", "lnkd.in",
+    "twitter.com", "x.com", "t.co",
+    "tiktok.com", "pinterest.com", "pin.it", "nextdoor.com",
+}
+
+
+def is_bot_hostile_host(host):
+    """True if host is (a subdomain of) a known crawler-blocking platform."""
+    host = host.lower()
+    if host.startswith("www."):
+        host = host[4:]
+    return any(host == d or host.endswith("." + d) for d in BOT_HOSTILE_HOSTS)
+
+
 # Query params whose *name* alone is worth a note when it carries a truthy
 # value - debug/admin toggles that shouldn't be reachable in production.
 TOGGLE_PARAM_NAMES = {"debug", "test", "admin", "trace", "verbose", "dev"}
@@ -435,6 +457,7 @@ class SiteFindings:
         self.query_skipped = 0
         self.broken = []             # (url, status_or_error, found_on)
         self.broken_resources = []   # (url, status_or_error, found_on, kind)
+        self.unverified_resources = []  # (url, detail, found_on, kind) - cross-origin bot-blocks
         self.security_codes = []     # (url, status, found_on)
         self.directory_listings = [] # (url, status, found_on)
         self.legacy_files = []       # (url, status, found_on)
@@ -468,6 +491,8 @@ def load_findings(db, netloc):
         f.broken.append((url, detail, found_on))
     for url, detail, found_on, kind in db.fetch_findings(netloc, "broken_resource"):
         f.broken_resources.append((url, detail, found_on, kind))
+    for url, detail, found_on, kind in db.fetch_findings(netloc, "unverified_resource"):
+        f.unverified_resources.append((url, detail, found_on, kind))
     for url, detail, found_on, kind in db.fetch_findings(netloc, "security_code"):
         f.security_codes.append((url, detail, found_on))
     for url, detail, found_on, kind in db.fetch_findings(netloc, "directory_listing"):
@@ -874,8 +899,14 @@ def check_only(ctx, url):
         try:
             resp = session.head(url, headers=headers, timeout=ctx.timeout,
                                 proxies=proxies, allow_redirects=True)
-            if resp.status_code not in RATE_LIMIT_CODES and (
-                    resp.status_code in (403, 405, 501) or resp.status_code >= 500):
+            # HEAD is only a speed optimization and is widely mishandled:
+            # plenty of servers, CDNs and (especially) iframe-embed hosts
+            # answer 404/405/400 to HEAD on a URL that GETs 200 fine, and a
+            # redirect's final hop may reject HEAD too. So treat ANY failing
+            # HEAD as merely "suspicious" and confirm it with a real GET
+            # before we ever call it broken. Only failing resources pay for
+            # the second request; the 200s stay single-request.
+            if resp.status_code not in RATE_LIMIT_CODES and resp.status_code >= 400:
                 resp = session.get(url, headers=headers, timeout=ctx.timeout,
                                    proxies=proxies, allow_redirects=True, stream=True)
                 resp.close()
@@ -894,6 +925,21 @@ def process_check_only(ctx, url, source, kind):
     # Findings are attributed to the site that *referenced* the link,
     # not the (often third-party) domain the link points to.
     netloc = site_key(source)
+
+    host = normalize_netloc(urlparse(url).netloc)
+    if is_bot_hostile_host(host):
+        # Don't fetch it (it'll just 400/403/999 at a bot) and don't call
+        # it broken. Note the host once per site so the behaviour is
+        # visible, then skip every other link to it silently.
+        if ctx.mark_seen("bothostile", netloc, host):
+            ctx.db.add_finding(netloc, "unverified_resource", url,
+                               f"{host} blocks crawlers - not checked "
+                               f"(links there are virtually never actually broken)",
+                               source, kind)
+            print(f"  [SKIP] bot-blocking host {host} - not checking links there")
+        ctx.bump_progress()
+        return
+
     result = check_only(ctx, url)
     ctx.bump_progress()
 
@@ -909,8 +955,22 @@ def process_check_only(ctx, url, source, kind):
         print(f"  [RATE LIMITED] ({kind}) {url}")
         return
     if status >= 400:
-        ctx.db.add_finding(netloc, "broken_resource", url, status, source, kind)
-        print(f"  [{status}] ({kind}) {url}")
+        res_host = normalize_netloc(urlparse(url).netloc)
+        cross_origin = bool(res_host) and res_host != netloc
+        if cross_origin and status in (401, 403):
+            # A third-party embed/CDN (common for iframes) blocking our bot
+            # with 401/403 is almost never a broken link - it renders fine
+            # in a real browser. Don't call it broken; note it separately.
+            ctx.db.add_finding(netloc, "unverified_resource", url,
+                               f"{status} (cross-origin, likely bot-blocked - not confirmed broken)",
+                               source, kind)
+            print(f"  [UNVERIFIED] {status} ({kind}) {url}")
+        else:
+            detail = str(status)
+            if getattr(result, "history", None):
+                detail = f"{status} (after redirect to {result.url})"
+            ctx.db.add_finding(netloc, "broken_resource", url, detail, source, kind)
+            print(f"  [{status}] ({kind}) {url}")
 
     path_lower = urlparse(url).path.lower()
     if path_lower.endswith(LEGACY_EXTENSIONS):
@@ -1019,14 +1079,18 @@ def process_url(ctx, url, found_on, depth):
         ctx.bump_progress()
         return
 
+    broken_detail = str(status)
+    if getattr(resp, "history", None):
+        broken_detail = f"{status} (after redirect to {resp.url})"
+
     if status == 404 or status == 410:
-        ctx.db.add_finding(netloc, "broken", url, status, found_on)
+        ctx.db.add_finding(netloc, "broken", url, broken_detail, found_on)
         print(f"  [{status}] {url}")
     elif status in SECURITY_STATUS_CODES:
         ctx.db.add_finding(netloc, "security_code", url, status, found_on)
         print(f"  [{status}] (security-watch) {url}")
     elif status >= 400:
-        ctx.db.add_finding(netloc, "broken", url, status, found_on)
+        ctx.db.add_finding(netloc, "broken", url, broken_detail, found_on)
         print(f"  [{status}] {url}")
 
     path_lower = urlparse(url).path.lower()
@@ -1159,6 +1223,11 @@ def write_report(findings, elapsed, outdir, args, partial=False):
             lambda r: f"[{r[1]}] ({r[3]}) {r[0]}\n    found on: {r[2]}\n",
         )
         _write_section(
+            f, "UNVERIFIED RESOURCES (bot-blocking hosts / cross-origin 401-403 - likely fine, not broken)",
+            findings.unverified_resources,
+            lambda r: f"[{r[1]}] ({r[3]}) {r[0]}\n    found on: {r[2]}\n",
+        )
+        _write_section(
             f, "SECURITY-WATCH STATUS CODES (401/403/5xx)", findings.security_codes,
             lambda r: f"[{r[1]}] {r[0]}\n    found on: {r[2]}\n",
         )
@@ -1236,6 +1305,8 @@ def build_rows(findings):
         rows.append(make_row("Broken Link", status, url, found_on))
     for url, status, found_on, kind in findings.broken_resources:
         rows.append(make_row(f"Broken Resource ({kind})", status, url, found_on))
+    for url, detail, found_on, kind in findings.unverified_resources:
+        rows.append(make_row(f"Unverified Resource ({kind})", detail, url, found_on))
     for url, status, found_on in findings.security_codes:
         rows.append(make_row("Security Watch", status, url, found_on))
     for url, detail, found_on in findings.exposed_paths:
@@ -1508,6 +1579,7 @@ def main():
         html_path = write_html(findings, elapsed, args.output_dir, args)
         print(f"  {netloc}: {findings.pages_crawled} pages -> {report_path} / {html_path}")
         print(f"     {len(findings.broken)} broken, {len(findings.broken_resources)} broken resources, "
+              f"{len(findings.unverified_resources)} unverified/bot-blocked, "
               f"{len(findings.security_codes)} security-watch, {len(findings.exposed_paths)} exposed paths, "
               f"{len(findings.rate_limited)} rate-limited, {len(findings.directory_listings)} dir listings, "
               f"{len(findings.legacy_files)} legacy, {len(findings.sensitive_files)} sensitive files, "

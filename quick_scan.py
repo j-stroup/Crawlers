@@ -32,6 +32,25 @@ from report_html import make_row, write_html_report
 FLAGGED_EXTENSIONS = (".pdf", ".txt", ".doc", ".docx")
 TIMEOUT = 10
 
+# Social / login-gated platforms that block crawlers by design - they
+# answer 400/403/999 to a bot no matter what, so a link to one is almost
+# never actually broken. We skip checking them instead of reporting noise.
+BOT_HOSTILE_HOSTS = {
+    "facebook.com", "fb.com", "fb.me", "fb.watch", "messenger.com",
+    "instagram.com", "threads.net",
+    "linkedin.com", "lnkd.in",
+    "twitter.com", "x.com", "t.co",
+    "tiktok.com", "pinterest.com", "pin.it", "nextdoor.com",
+}
+
+
+def is_bot_hostile_host(host):
+    """True if host is (a subdomain of) a known crawler-blocking platform."""
+    host = host.lower()
+    if host.startswith("www."):
+        host = host[4:]
+    return any(host == d or host.endswith("." + d) for d in BOT_HOSTILE_HOSTS)
+
 
 def normalize_netloc(netloc):
     """'www.example.com' and 'example.com' are the same site - strip a
@@ -66,7 +85,11 @@ def check_only(session, url):
     headers = {"User-Agent": random.choice(USER_AGENTS)}
     try:
         resp = session.head(url, headers=headers, timeout=TIMEOUT, allow_redirects=True)
-        if resp.status_code in (403, 405, 501) or resp.status_code >= 500:
+        # HEAD is just a speed optimization and is widely mishandled - many
+        # servers/CDNs and iframe-embed hosts answer 404/405/400 to HEAD on
+        # a URL that GETs 200 fine. Confirm ANY failing HEAD with a real GET
+        # before believing it, so we don't report false broken links.
+        if resp.status_code >= 400:
             resp = session.get(url, headers=headers, timeout=TIMEOUT, allow_redirects=True, stream=True)
             resp.close()
         return resp
@@ -115,6 +138,7 @@ def crawl(start_url, delay_min, delay_max, max_pages):
 
     broken = []    # (url, status_or_error, found_on, kind)
     flagged = []   # (url, status, found_on, kind)
+    skipped_hostile = []  # (url, source) - links to known bot-blocking hosts
 
     def record(url, status, source, kind):
         bad = (not isinstance(status, int)) or status >= 400
@@ -130,6 +154,9 @@ def crawl(start_url, delay_min, delay_max, max_pages):
         if url in checked:
             return
         checked.add(url)
+        if is_bot_hostile_host(urlparse(url).netloc):
+            skipped_hostile.append((url, source))
+            return
         result = check_only(session, url)
         time.sleep(random.uniform(delay_min, delay_max))
         if isinstance(result, Exception):
@@ -184,10 +211,10 @@ def crawl(start_url, delay_min, delay_max, max_pages):
         for link, kind in resource_links:
             check_and_record(link, url, kind)
 
-    return visited_pages, checked, broken, flagged
+    return visited_pages, checked, broken, flagged, skipped_hostile
 
 
-def write_report(start_url, visited_pages, checked, broken, flagged, elapsed, outdir):
+def write_report(start_url, visited_pages, checked, broken, flagged, skipped_hostile, elapsed, outdir):
     name = site_name(start_url)
     path = Path(outdir) / f"{name}.txt"
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -197,6 +224,10 @@ def write_report(start_url, visited_pages, checked, broken, flagged, elapsed, ou
         f.write(f"Generated: {datetime.now().isoformat(timespec='seconds')}\n")
         f.write(f"Pages crawled: {len(visited_pages)}\n")
         f.write(f"Links/resources checked: {len(checked)}\n")
+        if skipped_hostile:
+            hosts = sorted({normalize_netloc(urlparse(u).netloc) for u, _ in skipped_hostile})
+            f.write(f"Skipped (bot-blocking hosts, not checked): "
+                    f"{len(skipped_hostile)} link(s) to {', '.join(hosts)}\n")
         f.write(f"Duration: {elapsed:.1f}s\n")
         f.write("=" * 70 + "\n\n")
 
@@ -230,18 +261,21 @@ def build_rows(broken, flagged):
     return rows
 
 
-def write_html(start_url, visited_pages, checked, broken, flagged, elapsed, outdir):
+def write_html(start_url, visited_pages, checked, broken, flagged, skipped_hostile, elapsed, outdir):
     rows = build_rows(broken, flagged)
+    summary_lines = [
+        ("Pages crawled", str(len(visited_pages))),
+        ("Links/resources checked", str(len(checked))),
+        ("Broken", str(len(broken))),
+        ("Flagged files", str(len(flagged))),
+    ]
+    if skipped_hostile:
+        summary_lines.append(("Skipped bot-blocking hosts", str(len(skipped_hostile))))
     meta = {
         "title": f"Quick Scan Report - {start_url}",
         "subtitle": f"Generated {datetime.now().isoformat(timespec='seconds')} · {elapsed:.1f}s",
         "partial": False,
-        "summary_lines": [
-            ("Pages crawled", str(len(visited_pages))),
-            ("Links/resources checked", str(len(checked))),
-            ("Broken", str(len(broken))),
-            ("Flagged files", str(len(flagged))),
-        ],
+        "summary_lines": summary_lines,
     }
     return write_html_report(rows, meta, outdir, site_name(start_url))
 
@@ -259,17 +293,22 @@ def main():
 
     print(f"Scanning {start_url} ...")
     started = time.time()
-    visited_pages, checked, broken, flagged = crawl(start_url, args.delay_min, args.delay_max, args.max_pages)
+    visited_pages, checked, broken, flagged, skipped_hostile = crawl(
+        start_url, args.delay_min, args.delay_max, args.max_pages)
     elapsed = time.time() - started
 
-    report_path = write_report(start_url, visited_pages, checked, broken, flagged, elapsed, args.output_dir)
-    html_path = write_html(start_url, visited_pages, checked, broken, flagged, elapsed, args.output_dir)
+    report_path = write_report(start_url, visited_pages, checked, broken, flagged,
+                               skipped_hostile, elapsed, args.output_dir)
+    html_path = write_html(start_url, visited_pages, checked, broken, flagged,
+                           skipped_hostile, elapsed, args.output_dir)
 
     print()
     print(f"Pages crawled       : {len(visited_pages)}")
     print(f"Links/resources checked: {len(checked)}")
     print(f"Broken links/resources : {len(broken)}")
     print(f"Flagged files        : {len(flagged)}")
+    if skipped_hostile:
+        print(f"Skipped (bot-blocking hosts): {len(skipped_hostile)}")
     print(f"Report written to {report_path}")
     print(f"Sortable report      : {html_path}")
 

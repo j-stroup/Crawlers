@@ -24,6 +24,12 @@ Pages within the domain are fully crawled. Everything else found on a
 page - external `<a href>` links, `<img>`, `<link rel=stylesheet|icon>`,
 `<iframe>`, and `<script>` - gets a status check (broken image, dead
 external link, missing stylesheet, etc.) but is never crawled further.
+A failing `HEAD` is always confirmed with a real `GET` before being
+called broken (HEAD is widely mishandled - see deep_audit's note below),
+and links to known crawler-blocking platforms (Facebook, Instagram,
+LinkedIn, X, ...) are skipped rather than reported, since their `400`/
+`403` is just bot-blocking, not a dead link. The skip count (and which
+hosts) is noted at the top of the report.
 
 ```
 python quick_scan.py https://example.com
@@ -100,6 +106,29 @@ Broken-resource and external-link findings are attributed to the site
 that referenced them, not the (often third-party) domain the link points
 to - so a dead CDN image on example.com shows up in `example.com.txt`,
 not in a report for the CDN.
+
+**Avoiding false "404s" on resources.** Resources and external links are
+first checked with a cheap `HEAD`, but `HEAD` is widely mishandled - lots
+of servers, CDNs and especially iframe-embed hosts answer `404`/`405`/`400`
+to `HEAD` on a URL that `GET`s `200` fine, and a link that redirects to
+such a host hits the same thing. So any failing `HEAD` (status >= 400) is
+re-checked with a real `GET` before anything is ever called broken; only
+the small number of apparently-failing resources pay for the second
+request. On top of that, a **cross-origin** resource that returns
+`401`/`403` even to the `GET` (a third-party embed bot-blocking the
+crawler - common for iframes) goes into a separate "unverified /
+bot-blocked" bucket rather than "broken," because it renders fine in a
+real browser. Genuine `404`s after a redirect now show where they landed
+(`404 (after redirect to ...)`) so you can tell "the link is dead" from
+"the link redirects somewhere that's dead."
+
+Links to **known crawler-blocking platforms** (Facebook, Instagram,
+LinkedIn, X/Twitter, TikTok, Pinterest, ...) are never fetched or called
+broken - those sites answer `400`/`403`/`999` to any bot regardless, so a
+link to them is virtually never actually dead. They're noted once per host
+in the "unverified" bucket instead of flooding the report. The list lives
+in `BOT_HOSTILE_HOSTS` in each script if you need to add a site that keeps
+showing up as noise.
 
 ```
 # One site, defaults (8 threads, robots.txt respected, same-domain only)
@@ -201,6 +230,32 @@ record a finding - as "rate-limited / could not verify," never as a broken
 link. Net effect: if a site starts pushing back, the whole crawl quietly
 slows down instead of hammering it, and you don't get a report full of
 phantom "broken" links that were really just rate-limiting.
+
+## email_audit.py - find exposed email addresses
+
+Single-threaded, same politeness (randomized delay, rotating user-agent)
+as quick_scan.py. Crawls each domain (never leaves it), regex-scans every
+HTML page's raw markup for email addresses - catching both visible text
+and `mailto:` links in one pass - and writes a combined report plus a
+flat, deduped list.
+
+```
+python email_audit.py domains.txt
+python email_audit.py https://example.com https://other-site.com
+python email_audit.py domains.txt --max-pages 300 --output-dir reports
+```
+
+`domains.txt` is one domain/URL per line (`#` comments and blank lines
+ignored). If you pass more than one argument, each is treated as a
+domain directly instead of a file.
+
+Writes `email_audit_report.txt` (per-domain breakdown, each address with
+the first page it was found on) and `emails.txt` (flat sorted list of
+every unique address found, across all domains) into `--output-dir`
+(default: current directory).
+
+`--max-pages` is a per-site safety cap (0 = unlimited, same as
+quick_scan.py).
 
 ## Notes
 
