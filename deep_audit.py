@@ -71,6 +71,7 @@ import json
 import math
 import random
 import re
+import string
 import sys
 import threading
 import time
@@ -141,6 +142,16 @@ SECURITY_STATUS_CODES = {401, 403, 407, 500, 501, 502, 503, 504, 505, 507, 511}
 # Status codes that mean "slow down", handled with backoff + retry rather
 # than recorded as broken links.
 RATE_LIMIT_CODES = {429, 503}
+
+# Network exceptions that are usually momentary on a days-long crawl (a DNS
+# blip, a dropped connection, a read timeout under load) and don't mean the
+# URL is actually dead - worth a retry before we ever record "broken". A
+# malformed-URL error or a redirect loop is NOT here: retrying won't help.
+TRANSIENT_EXC = (
+    requests.exceptions.ConnectionError,
+    requests.exceptions.Timeout,
+    requests.exceptions.ChunkedEncodingError,
+)
 
 # Social / login-gated platforms that block crawlers by design - they
 # answer 400/403/429/999 (LinkedIn's infamous 999) to a bot regardless of
@@ -472,6 +483,7 @@ class SiteFindings:
         self.version_disclosure = [] # (url, detail, found_on)
         self.third_party_scripts = []# (url, detail, found_on)
         self.tabnabbing = []         # (url, detail, found_on)
+        self.scan_caveats = []       # (url, detail) - host behaviour affecting accuracy
         self.header_checked_url = None
         self.missing_security_headers = []
 
@@ -523,6 +535,8 @@ def load_findings(db, netloc):
         f.third_party_scripts.append((url, detail, found_on))
     for url, detail, found_on, kind in db.fetch_findings(netloc, "tabnabbing"):
         f.tabnabbing.append((url, detail, found_on))
+    for url, detail, found_on, kind in db.fetch_findings(netloc, "scan_caveat"):
+        f.scan_caveats.append((url, detail))
     return f
 
 
@@ -618,6 +632,121 @@ def parse_retry_after(resp):
 
 
 # --------------------------------------------------------------------------
+# Soft-404 detection
+# --------------------------------------------------------------------------
+
+class SoftNotFoundCache:
+    """Figures out how each host behaves for a URL that doesn't exist, so
+    broken links are caught even on sites that don't return an honest 404.
+
+    Probes one guaranteed-missing URL per host (once) and classifies it:
+      honest    - missing URL -> 4xx/5xx. Status codes are trustworthy;
+                  nothing special to do.
+      redirect  - missing URL -> redirects to a specific non-root page L
+                  (a /404 or /not-found). Any crawled page that also lands
+                  on L is a soft 404.
+      soft200   - missing URL -> 200 with a not-found body distinct from the
+                  homepage. Any crawled page whose body (with its own path
+                  scrubbed out) matches that body is a soft 404.
+      spa       - missing URL -> 200 with the SAME body as the homepage
+                  (single-page-app / catch-all). Status can't tell a real
+                  page from a missing one here, so we don't guess per page -
+                  just raise one host-level caveat.
+      rootredir - missing URL -> redirects to the site root. A legit "moved
+                  to home" redirect looks identical, so (to avoid false
+                  positives) only a host-level caveat, no per-page flags.
+
+    Favors precision over recall throughout: when unsure, it does nothing
+    rather than risk calling a live page broken.
+    """
+
+    def __init__(self, ctx):
+        self.ctx = ctx
+        self.profiles = {}
+        self.lock = threading.Lock()
+
+    def _raw_get(self, url):
+        try:
+            host = normalize_netloc(urlparse(url).netloc)
+            self.ctx.throttle.wait(host)
+            headers = {"User-Agent": random.choice(USER_AGENTS)}
+            return self.ctx.session().get(
+                url, headers=headers, timeout=self.ctx.timeout,
+                proxies=self.ctx.get_proxies(), allow_redirects=True)
+        except Exception:
+            return None
+
+    @staticmethod
+    def _signature(text, url):
+        # Scrub the requested path (and its last segment) out of the body
+        # first, so a "Page /foo not found" echo doesn't make every missing
+        # URL look unique, then hash a normalized slice of what's left.
+        path = urlparse(url).path
+        seg = path.rsplit("/", 1)[-1]
+        t = (text or "").lower()
+        for needle in (path.lower(), seg.lower()):
+            if needle and len(needle) >= 3:
+                t = t.replace(needle, "")
+        t = re.sub(r"\s+", " ", t).strip()
+        return hashlib.sha1(t[:20000].encode("utf-8", "replace")).hexdigest()
+
+    def _compute(self, scheme, host):
+        base = f"{scheme}://{host}"
+        token = "nf-" + "".join(random.choices(string.ascii_lowercase + string.digits, k=28))
+        g = self._raw_get(f"{base}/{token}")
+        if g is None or g.status_code >= 400:
+            return {"mode": "honest"}
+        landing = canonicalize_url(g.url)
+        if getattr(g, "history", None):
+            if urlparse(landing).path.rstrip("/") in ("", "/"):
+                return {"mode": "rootredir", "landing": landing}
+            return {"mode": "redirect", "landing": landing}
+        # 200 with no redirect - compare the body to the homepage's.
+        gsig = self._signature(g.text, g.url)
+        h = self._raw_get(base + "/")
+        if h is not None and h.status_code < 400 and self._signature(h.text, base + "/") == gsig:
+            return {"mode": "spa"}
+        return {"mode": "soft200", "sig": gsig}
+
+    def profile(self, scheme, host):
+        with self.lock:
+            prof = self.profiles.get(host)
+        if prof is not None:
+            return prof
+        prof = self._compute(scheme, host)        # network, outside the lock
+        with self.lock:
+            return self.profiles.setdefault(host, prof)
+
+    def is_soft_404(self, url, resp, text):
+        """Return a human reason string if this fetched page is really a
+        'not found' in disguise, else None. text=None checks only the
+        redirect signal (no body needed)."""
+        parsed = urlparse(url)
+        prof = self.profile(parsed.scheme, normalize_netloc(parsed.netloc))
+        mode = prof["mode"]
+        if mode == "redirect":
+            if (getattr(resp, "history", None)
+                    and canonicalize_url(resp.url) == prof["landing"]
+                    and canonicalize_url(url) != prof["landing"]):
+                return f"redirects to {prof['landing']} (this site's not-found page)"
+        elif mode == "soft200" and text is not None:
+            if not getattr(resp, "history", None) and self._signature(text, url) == prof["sig"]:
+                return "returns 200 but the body matches this site's not-found page"
+        return None
+
+    def caveat(self, scheme, host):
+        """A one-line host-level caveat for spa/rootredir hosts, else None."""
+        mode = self.profile(scheme, host)["mode"]
+        if mode == "spa":
+            return ("returns 200 for unknown URLs (single-page-app / catch-all) - "
+                    "broken links can't be confirmed by HTTP status on this host")
+        if mode == "rootredir":
+            return ("redirects unknown URLs to the homepage - dead links may be "
+                    "silently masked, so broken-link results here are best-effort")
+        return None
+
+
+# --------------------------------------------------------------------------
 # Crawl context shared across worker threads
 # --------------------------------------------------------------------------
 
@@ -635,6 +764,8 @@ class Context:
         self.robots = RobotsCache(ignore=args.ignore_robots)
         self.throttle = HostThrottle()
         self.max_retries = args.max_retries
+        self.soft404_enabled = not args.no_soft_404
+        self.softnf = SoftNotFoundCache(self)
         self._local = threading.local()
 
         self.proxy_list = self._load_proxies(args.proxy, args.proxy_file)
@@ -911,6 +1042,11 @@ def check_only(ctx, url):
                                    proxies=proxies, allow_redirects=True, stream=True)
                 resp.close()
         except Exception as exc:
+            if isinstance(exc, TRANSIENT_EXC) and attempt < attempts - 1:
+                backoff = min(2 ** attempt, 8)
+                print(f"  [RETRY] transient error on {host} ({type(exc).__name__}) - retry in {backoff}s")
+                time.sleep(backoff)
+                continue
             return exc
         if resp.status_code in RATE_LIMIT_CODES and attempt < attempts - 1:
             cooldown = ctx.throttle.penalize(host, parse_retry_after(resp))
@@ -972,15 +1108,19 @@ def process_check_only(ctx, url, source, kind):
             ctx.db.add_finding(netloc, "broken_resource", url, detail, source, kind)
             print(f"  [{status}] ({kind}) {url}")
 
-    path_lower = urlparse(url).path.lower()
-    if path_lower.endswith(LEGACY_EXTENSIONS):
-        ctx.db.add_finding(netloc, "legacy_file", url, status, source)
-        print(f"  [LEGACY FILE] {url}")
-    verdict = sensitive_verdict(url)
-    if verdict:
-        detail = status if verdict == "high" else f"{status} (dump-like filename)"
-        ctx.db.add_finding(netloc, "sensitive_file", url, detail, source)
-        print(f"  [SENSITIVE FILE] ({verdict}) {url}")
+    # Only flag file-type findings for resources that actually exist - a
+    # legacy/sensitive file at a 4xx/5xx is just a dead link (already in the
+    # broken section), not a file published on the site.
+    if status < 400:
+        path_lower = urlparse(url).path.lower()
+        if path_lower.endswith(LEGACY_EXTENSIONS):
+            ctx.db.add_finding(netloc, "legacy_file", url, status, source)
+            print(f"  [LEGACY FILE] {url}")
+        verdict = sensitive_verdict(url)
+        if verdict:
+            detail = status if verdict == "high" else f"{status} (dump-like filename)"
+            ctx.db.add_finding(netloc, "sensitive_file", url, detail, source)
+            print(f"  [SENSITIVE FILE] ({verdict}) {url}")
 
 
 # --------------------------------------------------------------------------
@@ -1056,6 +1196,11 @@ def process_url(ctx, url, found_on, depth):
                 proxies=proxies, allow_redirects=True,
             )
         except Exception as exc:
+            if isinstance(exc, TRANSIENT_EXC) and attempt < attempts - 1:
+                backoff = min(2 ** attempt, 8)
+                print(f"  [RETRY] transient error on {host} ({type(exc).__name__}) - retry in {backoff}s")
+                time.sleep(backoff)
+                continue
             ctx.db.add_finding(netloc, "broken", url, f"ERROR: {exc}", found_on)
             print(f"  [ERROR] {url} -> {exc}")
             ctx.bump_progress()
@@ -1094,23 +1239,43 @@ def process_url(ctx, url, found_on, depth):
         print(f"  [{status}] {url}")
 
     path_lower = urlparse(url).path.lower()
-    if path_lower.endswith(LEGACY_EXTENSIONS):
-        ctx.db.add_finding(netloc, "legacy_file", url, status, found_on)
-        print(f"  [LEGACY FILE] {url}")
-    verdict = sensitive_verdict(url)
-    if verdict:
-        detail = status if verdict == "high" else f"{status} (dump-like filename)"
-        ctx.db.add_finding(netloc, "sensitive_file", url, detail, found_on)
-        print(f"  [SENSITIVE FILE] ({verdict}) {url}")
-
-    for reason in analyze_params(url):
-        ctx.db.add_finding(netloc, "risky_param", url, reason, found_on)
-        print(f"  [RISKY PARAM] {url} -> {reason}")
+    # Only flag file-type / parameter findings for things that actually
+    # exist (reachable). A legacy/sensitive file at a 404 isn't "a PDF on
+    # the site", it's just a dead link - and it's already in the broken
+    # section, so flagging it here too is duplicate noise.
+    if status < 400:
+        if path_lower.endswith(LEGACY_EXTENSIONS):
+            ctx.db.add_finding(netloc, "legacy_file", url, status, found_on)
+            print(f"  [LEGACY FILE] {url}")
+        verdict = sensitive_verdict(url)
+        if verdict:
+            detail = status if verdict == "high" else f"{status} (dump-like filename)"
+            ctx.db.add_finding(netloc, "sensitive_file", url, detail, found_on)
+            print(f"  [SENSITIVE FILE] ({verdict}) {url}")
+        for reason in analyze_params(url):
+            ctx.db.add_finding(netloc, "risky_param", url, reason, found_on)
+            print(f"  [RISKY PARAM] {url} -> {reason}")
 
     ctx.bump_progress()
 
     if status >= 400:
         return
+
+    # Soft-404 handling - catch "not found" pages that lie with a 200 or a
+    # redirect, on hosts that don't return honest 404s. The redirect signal
+    # needs no body, so check it before we commit to treating this as a real
+    # page; the body signal is checked once we have the HTML below.
+    if ctx.soft404_enabled:
+        scheme = urlparse(url).scheme
+        host_caveat = ctx.softnf.caveat(scheme, host)
+        if host_caveat and ctx.mark_seen("caveat", netloc, host):
+            ctx.db.add_finding(netloc, "scan_caveat", f"{scheme}://{host}/", host_caveat)
+            print(f"  [CAVEAT] {host}: {host_caveat}")
+        soft = ctx.softnf.is_soft_404(url, resp, None)
+        if soft:
+            ctx.db.add_finding(netloc, "broken", url, f"soft 404 - {soft}", found_on)
+            print(f"  [SOFT 404] {url} -> {soft}")
+            return
 
     check_response_extras(ctx, resp, url, netloc, depth)
     if depth == 0:
@@ -1124,6 +1289,14 @@ def process_url(ctx, url, found_on, depth):
         return
 
     text = resp.text
+
+    if ctx.soft404_enabled:
+        soft = ctx.softnf.is_soft_404(url, resp, text)
+        if soft:
+            ctx.db.add_finding(netloc, "broken", url, f"soft 404 - {soft}", found_on)
+            print(f"  [SOFT 404] {url} -> {soft}")
+            return
+
     scan_for_secrets(text, url, netloc, ctx.db)
 
     if not is_html:
@@ -1213,6 +1386,13 @@ def write_report(findings, elapsed, outdir, args, partial=False):
                     f"{findings.query_skipped}\n")
         f.write(f"Duration: {elapsed:.1f}s\n")
         f.write("=" * 70 + "\n\n")
+
+        if findings.scan_caveats:
+            f.write("SCAN CAVEATS (host behaviour that affects broken-link accuracy)\n")
+            f.write("-" * 70 + "\n")
+            for url, detail, *_ in findings.scan_caveats:
+                f.write(f"{urlparse(url).netloc}: {detail}\n")
+            f.write("\n")
 
         _write_section(
             f, "BROKEN LINKS (404/410/other errors)", findings.broken,
@@ -1337,6 +1517,8 @@ def build_rows(findings):
         rows.append(make_row("Third-Party Script", detail, url, found_on))
     for url, detail, found_on in findings.tabnabbing:
         rows.append(make_row("Tabnabbing Link", detail, url, found_on))
+    for url, detail in findings.scan_caveats:
+        rows.append(make_row("Scan Caveat", detail, url))
     return rows
 
 
@@ -1472,9 +1654,15 @@ def main():
     parser.add_argument("--delay-max", type=float, default=0.6, help="Max seconds between requests per thread (default 0.6)")
     parser.add_argument("--timeout", type=float, default=DEFAULT_TIMEOUT, help="Per-request timeout in seconds")
     parser.add_argument("--max-retries", type=int, default=2,
-                         help="Times to retry a URL that answers 429/503 (rate-limited) before giving up, "
-                              "with growing per-host backoff (default 2). Rate-limited URLs are reported as "
-                              "'could not verify', never as broken links.")
+                         help="Times to retry a URL that answers 429/503 (rate-limited) OR hits a transient "
+                              "network error (timeout, dropped connection) before giving up, with growing "
+                              "per-host backoff (default 2). Rate-limited URLs are reported as 'could not "
+                              "verify', never as broken links.")
+    parser.add_argument("--no-soft-404", action="store_true",
+                         help="Disable soft-404 detection. By default, each host is probed once with a "
+                              "guaranteed-missing URL; pages that then 'lie' with a 200 or a redirect to the "
+                              "site's not-found page are still caught as broken. Turn off if the two probe "
+                              "requests per host are unwanted.")
     parser.add_argument("--max-pages", type=int, default=5000,
                          help="Safety cap on total URLs discovered across all sites, pages and resources combined "
                               "(0 = unlimited, default 5000)")

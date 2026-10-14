@@ -25,6 +25,7 @@ CRITICAL_CATEGORIES = {
 WARNING_CATEGORIES = {
     "Legacy File", "Sensitive File", "Missing Security Header",
     "Risky Parameter", "Flagged File", "Mixed Content", "Cookie Flag",
+    "Scan Caveat",
 }
 # Everything else (Rate Limited, Public/Low-Confidence Key, Version
 # Disclosure, Third-Party Script, Tabnabbing Link) falls through to the

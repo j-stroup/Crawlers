@@ -55,6 +55,9 @@ else's site gets caught without spidering their whole domain.
 Finds:
 - 404/410s as broken links; 401/403/407/5xx as a separate "security-watch"
   bucket (auth issues, server errors that can leak internals)
+- **Soft 404s** - broken links on sites that don't return an honest 404
+  (SPA/catch-all or custom error pages that answer `200`, or redirect dead
+  links to a "not found" page). See the accuracy note below.
 - 429/503 rate-limiting handled with per-host backoff + retry (see below),
   reported as "could not verify" rather than as a broken link
 - Broken resources: dead images, stylesheets, iframes, scripts, and
@@ -129,6 +132,37 @@ link to them is virtually never actually dead. They're noted once per host
 in the "unverified" bucket instead of flooding the report. The list lives
 in `BOT_HOSTILE_HOSTS` in each script if you need to add a site that keeps
 showing up as noise.
+
+**Soft-404 detection (catches broken links honest-status checks miss).**
+Not every site returns a real `404` for a missing page - SPAs serve the app
+shell at `200` for everything, and plenty of sites answer `200` with a
+"page not found" template or quietly redirect dead links to a `/not-found`
+page or the homepage. A pure status-code check sails right past those. So
+at the start of each host the crawler probes one guaranteed-missing URL and
+learns how that host behaves:
+
+- *honest* (missing → `4xx`): nothing to do, status codes are trusted.
+- *redirect to a real not-found page* / *`200` with a distinct not-found
+  body*: any crawled page that matches is flagged as a **soft 404** in the
+  broken-links section (with the reason), so these get caught.
+- *SPA/catch-all* (`200` with the homepage shell) or *redirect to the
+  homepage*: can't be told apart from a real page by status/redirect alone,
+  so instead of guessing per page (which would false-positive everything),
+  the report gets **one "scan caveat"** at the top noting that broken-link
+  results for that host are best-effort.
+
+It costs two extra requests per host, once. Turn it off with
+`--no-soft-404`.
+
+**Transient errors are retried, not reported.** A momentary timeout, DNS
+blip or dropped connection on a days-long crawl no longer becomes a
+permanent false "broken" finding - those are retried (up to `--max-retries`,
+same backoff as rate-limiting) and only recorded if they still fail. A
+malformed URL or redirect loop isn't retried (retrying wouldn't help).
+
+Legacy/sensitive-file findings are only raised for files that **actually
+exist** (reachable), so a dead `.pdf` shows up once as a broken link rather
+than also as a phantom "legacy file."
 
 ```
 # One site, defaults (8 threads, robots.txt respected, same-domain only)
