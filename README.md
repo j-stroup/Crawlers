@@ -291,6 +291,24 @@ every unique address found, across all domains) into `--output-dir`
 `--max-pages` is a per-site safety cap (0 = unlimited, same as
 quick_scan.py).
 
+**Resumable at the domain level.** Progress is checkpointed to
+`<output-dir>/.email_audit_state.json` after each domain finishes
+(queue ran dry, or it hit `--max-pages` and moved on). If the run is
+interrupted - Ctrl+C, closed terminal, crash - just run the exact same
+command again: already-completed domains are skipped, the reports are
+appended to (not overwritten, so nothing already found is lost), and
+the flat `emails.txt` is deduped across runs. Once the whole list
+finishes in one run, the state file is removed, so a later re-run of
+the same `domains.txt` starts a brand new audit rather than thinking
+there's nothing left to do. `--fresh` ignores any saved state and
+starts the whole list over, overwriting the existing reports.
+
+Only the domain that was *mid-crawl* at the moment of interruption gets
+fully re-crawled from its start page on resume (not resumed mid-page) -
+for a tool whose whole job is "did any email show up on this site,"
+that's cheap enough not to bother persisting the actual page-by-page
+frontier the way deep_audit.py does for its much longer crawls.
+
 ## Notes
 
 - Both tools rotate through a shared pool of real browser user-agent
