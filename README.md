@@ -291,6 +291,19 @@ every unique address found, across all domains) into `--output-dir`
 `--max-pages` is a per-site safety cap (0 = unlimited, same as
 quick_scan.py).
 
+**Crawl order is prioritized, not plain breadth-first.** On a site with
+thousands of near-identical pages (blog posts, news, event listings),
+a flat BFS can burn through the whole `--max-pages` budget on those
+before ever reaching the one page that actually lists an email. Every
+newly-found link is instead ranked by its path before being queued:
+`contact`/`about`/`team`/`support`/`privacy`/etc. pages jump to the
+front (right after the homepage), `blog`/`news`/`press`/`event`/
+`product`/`category`/`tag`/`archive`-shaped paths drop to the back, and
+everything else crawls in the usual order in between. So when the cap
+does cut a crawl short, it's the archive/listing pages that get
+sacrificed, not the contact page. (`link_priority()` has the keyword
+lists if a site's naming doesn't match them.)
+
 **Resumable at the domain level.** Progress is checkpointed to
 `<output-dir>/.email_audit_state.json` after each domain finishes
 (queue ran dry, or it hit `--max-pages` and moved on). If the run is

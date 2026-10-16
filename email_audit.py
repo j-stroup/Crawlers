@@ -15,12 +15,12 @@ Usage:
 """
 
 import argparse
+import heapq
 import json
 import random
 import re
 import sys
 import time
-from collections import deque
 from datetime import datetime
 from pathlib import Path
 from urllib.parse import urlparse
@@ -66,6 +66,34 @@ def canonicalize(url):
     return f"{parsed.scheme}://{netloc}{path}"
 
 
+# Path keywords for crawl prioritization, not for deciding what to visit
+# - every in-domain page still gets crawled eventually. The point is
+# ordering: on a huge site that will hit --max-pages long before the
+# queue empties, a contact/about page should be crawled within the
+# first few requests instead of however many hops deep it happens to be
+# linked from, and an endless blog/news/event archive should be the
+# first thing sacrificed when the cap hits.
+HIGH_VALUE_PATH_HINTS = (
+    "contact", "about", "team", "staff", "support", "help",
+    "impressum", "imprint", "legal", "privacy", "terms",
+    "connect", "reach", "get-in-touch", "who-we-are", "directory", "location",
+)
+LOW_VALUE_PATH_HINTS = (
+    "blog", "news", "press", "event", "article", "product",
+    "category", "categories", "tag", "archive",
+)
+
+
+def link_priority(url):
+    """Lower sorts first. 0 is reserved for the seed page."""
+    path = urlparse(url).path.lower()
+    if any(hint in path for hint in HIGH_VALUE_PATH_HINTS):
+        return 1
+    if any(hint in path for hint in LOW_VALUE_PATH_HINTS):
+        return 3
+    return 2
+
+
 def fetch_page(session, url, headers, timeout, max_fetch_seconds):
     """Streamed GET with a hard wall-clock deadline. A plain
     requests timeout isn't enough here: its read-timeout clock resets on
@@ -94,7 +122,8 @@ def crawl_domain(start_url, delay_min, delay_max, max_pages, timeout, max_fetch_
     seed = canonicalize(start_url)
     visited = set()
     found_on = {seed: "(seed)"}
-    queue = deque([seed])
+    seq = 0
+    queue = [(0, seq, seed)]  # (priority, insertion order, url) - lowest priority pops first
     emails = {}  # email -> first page URL it was found on
 
     def record_emails(url, text):
@@ -109,7 +138,7 @@ def crawl_domain(start_url, delay_min, delay_max, max_pages, timeout, max_fetch_
             print(f"  reached --max-pages limit ({max_pages}), stopping {netloc}")
             break
 
-        url = queue.popleft()
+        _priority, _seq, url = heapq.heappop(queue)
         if url in visited:
             continue
         visited.add(url)
@@ -141,7 +170,8 @@ def crawl_domain(start_url, delay_min, delay_max, max_pages, timeout, max_fetch_
             link = canonicalize(link)
             if same_domain(link, netloc) and link not in found_on:
                 found_on[link] = url
-                queue.append(link)
+                seq += 1
+                heapq.heappush(queue, (link_priority(link), seq, link))
 
     return visited, emails
 
@@ -252,7 +282,7 @@ def main():
     parser.add_argument("inputs", nargs="+", help="Domains/URLs, or a single file with one domain per line")
     parser.add_argument("--delay-min", type=float, default=0.4, help="Min seconds between requests (default 0.4)")
     parser.add_argument("--delay-max", type=float, default=1.2, help="Max seconds between requests (default 1.2)")
-    parser.add_argument("--max-pages", type=int, default=250, help="Per-site safety cap on pages crawled (0 = unlimited, default 250)")
+    parser.add_argument("--max-pages", type=int, default=150, help="Per-site safety cap on pages crawled (0 = unlimited, default 150)")
     parser.add_argument("--timeout", type=int, default=10, help="Per-request connect/read timeout in seconds (default 10)")
     parser.add_argument("--max-fetch-seconds", type=float, default=30, help="Hard wall-clock cap per request regardless of how slowly the server sends data (default 30)")
     parser.add_argument("--output-dir", default=".", help="Directory to write reports into (default: current dir)")
