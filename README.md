@@ -1,8 +1,9 @@
 # Crawlers
 
-Two link/file auditors for websites you own or manage. Neither one is a
-vulnerability scanner - the goal is housekeeping: find broken links, find
-PDFs/docs that shouldn't be on a modern site, and flag anything that
+Tools for auditing and pulling content off websites you own or manage.
+None of them are vulnerability scanners - the goal is housekeeping: find
+broken links, find PDFs/docs that shouldn't be on a modern site, find
+exposed email addresses, grab every image, and flag anything that
 deserves a closer look by hand.
 
 ## Setup
@@ -322,13 +323,56 @@ for a tool whose whole job is "did any email show up on this site,"
 that's cheap enough not to bother persisting the actual page-by-page
 frontier the way deep_audit.py does for its much longer crawls.
 
+## image_scraper.py - download every image on a list of sites
+
+Same crawl mechanics as email_audit.py (same-domain only, politeness
+delay, resumable at the domain level, `--fresh`) but plain
+breadth-first order instead of the contact-page priority queue - there's
+no equivalent "most likely" page for images, they're everywhere, so
+prioritizing would just mean guessing wrong instead of right.
+
+Looks at `<img>` tags only (both `src` and every URL listed in
+`srcset`) - not CSS `background-image`, not favicons, not `og:image`
+previews. Each image is downloaded and hashed; if the exact bytes were
+already saved (the same logo linked from every page, or the same file
+served from two different URLs), it's logged as a duplicate and not
+saved again - genuinely different responsive variants (`photo-320w.jpg`
+vs `photo-1200w.jpg`) are different bytes, so both get saved.
+
+```
+python image_scraper.py domains.txt
+python image_scraper.py https://example.com https://other-site.com
+python image_scraper.py domains.txt --max-pages 300 --max-images 500 --output-dir reports
+```
+
+Saves images to `<output-dir>/images/<domain>/` (collisions on an
+identical filename with *different* content get a `-2`, `-3`, ...
+suffix) and writes `images_manifest.txt` - same "written as it goes"
+live log as email_audit_report.txt, listing each image's source URL,
+the page it was found on, and where it landed (or that it was a
+duplicate).
+
+`--max-images` is an additional per-site safety cap (default 300,
+0 = unlimited) alongside `--max-pages` - a single gallery/product page
+can reference far more images than there are pages, so page count
+alone isn't a tight enough budget for disk usage.
+
+`--fresh` here also **deletes** the domain's previously-downloaded
+images under `images/` before starting over, not just the text report -
+otherwise a truly fresh re-run would leave old files mixed in
+alongside new ones with no way to tell them apart.
+
 ## Notes
 
-- Both tools rotate through a shared pool of real browser user-agent
-  strings (`user_agents.py`) instead of sending a default
-  `python-requests/x.x` header.
+- All three crawlers (quick_scan, deep_audit, email_audit) rotate
+  through a shared pool of real browser user-agent strings
+  (`user_agents.py`) instead of sending a default `python-requests/x.x`
+  header; image_scraper does too, since it reuses the same page-fetching
+  code as email_audit.
 - The "risky params" and "security-watch status codes" lists are
   heuristics meant to shorten your manual review list, not a claim that
   something is actually vulnerable.
-- Report files (and anything in `reports/`) are gitignored by default
-  since they can contain masked-but-still-sensitive findings.
+- Report files, manifests, and downloaded images are all gitignored by
+  default (`*.txt`, `.*_state.json`, `images/`, `reports/`) since
+  reports can contain masked-but-still-sensitive findings and the
+  others are regenerable run output, not source.

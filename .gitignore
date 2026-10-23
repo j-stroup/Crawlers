@@ -9,3 +9,5 @@ test_reports*/
 *.db-shm
 *.txt
 !requirements.txt
+.*_state.json
+images/
