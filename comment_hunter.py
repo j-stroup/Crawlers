@@ -19,9 +19,14 @@ Outputs (all in --output-dir, all append-only / rebuilt as it goes):
     comment_hunter.txt      - a plain-text running log, easy to skim/paste
     gallery.html            - a dark, monospaced gallery (open it and watch)
 
+Each domain's homepage is always crawled first (eggs cluster there), and
+--max-pages-per-domain (default 5) keeps the crawl from sinking into any
+one site so it keeps hopping to new domains.
+
 Usage:
     python comment_hunter.py https://example.com --max-pages 500
-    python comment_hunter.py seeds.txt --max-pages 5000 --max-pages-per-domain 30
+    python comment_hunter.py seeds.txt --max-pages 5000 --max-pages-per-domain 3
+    python comment_hunter.py seeds.txt --max-pages-per-domain 1   # homepages only
     python comment_hunter.py seeds.txt --fresh
 """
 
@@ -112,19 +117,66 @@ STRONG_SIGNALS = {
                    "touch this and", "if it works", "don't ask"),
 }
 
-# Softer dev-voice words: each adds to the score but doesn't auto-keep.
-DEV_VOICE = (
-    "todo", "fixme", "hack", "kludge", "workaround", "temporary", "temp fix",
-    "quick fix", "for now", "spaghetti", "duct tape", "band-aid", "bandaid",
-    "magic", "voodoo", "wtf", "ugh", "sigh", "yikes", "oops", "whoops",
-    "legacy", "deprecated", "gross", "nasty", "ridiculous", "stupid",
-    "i think", "i guess", "probably", "hopefully", "fingers crossed",
-    "note to self", "warning", "careful", "beware", "danger",
+# Dev-voice, split by confidence. STRONG words carry real personality/humor
+# and essentially never appear in routine code documentation, so one is
+# enough to keep. WEAK words are mildly informal but also show up in boring
+# dev-doc, so they only count a little and need company.
+STRONG_DEV = (
+    "hack", "kludge", "voodoo", "black magic", "dark magic", "wtf", "ugh",
+    "sigh", "yikes", "oops", "whoops", "spaghetti", "duct tape", "band-aid",
+    "bandaid", "fingers crossed", "god help", "i hate", "nobody knows",
+    "no one knows", "no idea", "don't ask", "dont ask", "good luck",
+    "future dev", "future developer", "poor soul", "next person", "whoever",
+    " lol", "haha", "hehe", " omg", "yolo", "ship it", "cursed", "haunted",
+    "scared", "afraid", "temporary", "temp fix", "quick fix", "nightmare",
+    "don't touch", "dont touch", "do not touch", "don't remove", "dont remove",
+    "please work", "it works", "why does", "how is this", "how does this",
+    "somehow", "mystery", "magic number", "i'm sorry", "im sorry", "sorry",
+    "apolog", "forgive", "here be dragons", "beer", "coffee", " 3am", "3 am",
+    "midnight", "deadline", "i swear", "i promise", "trust me", "don't judge",
+    "dont judge", "rage", "screaming", "crying", "in tears", "hair out",
+)
+WEAK_DEV = (
+    "todo", "fixme", "for now", "workaround", "hopefully", "probably",
+    "i think", "i guess", "temporarily", "sadly", "unfortunately",
 )
 
-# Kaomoji / emoticons - a strong "a human typed this" tell.
-KAOMOJI = ("¯\\_(ツ)_/¯", "(ツ)", "(╯", "ಠ_ಠ", "¯\\", ":-)", ":)", ":-(", ";-)",
-           "<3", "❤", "♥", ">_<", "^_^", "o_o", "0_0", "d:", ":d")
+# Emoticons - matched only when they stand alone (surrounded by space/edge/
+# punctuation), never as substrings. The old substring list fired on things
+# like "modified:" (-> "d:") and "<300" (-> "<3"); this does not.
+EMOTICON_RE = re.compile(
+    r"(?:^|\s)(?::-?\)|:-?\(|:-?D|;-?\)|<3|\^_\^|>_<|¯\\_\(ツ\)_/¯|\(╯°|ಠ_ಠ|owo|uwu)"
+    r"(?=$|\s|[.,!?])"
+)
+# Real emoji - an intentional, unambiguous "a human put this here" signal.
+_EMOJI_RE = re.compile(
+    "[\U0001F000-\U0001FAFF\U00002600-\U000027BF⭐❤♥⚠⬆✔]"
+)
+
+
+def has_emoji(text):
+    return bool(_EMOJI_RE.search(text))
+
+
+# Keyword matching must respect word boundaries, or short words match inside
+# longer ones: "rage" in "AVERAGE", "ugh" in "through", "sigh" in "Insights",
+# "oops" in "loops", "secret" in "secretary", "pray" in "spray". A plain
+# substring check is exactly how the first version produced ~90% noise.
+def _kw_pattern(needle):
+    n = needle.strip()
+    left = r"(?<![a-z0-9])" if n[:1].isalnum() else ""
+    right = r"(?![a-z0-9])" if n[-1:].isalnum() else ""
+    return left + re.escape(n) + right
+
+
+def _kw_re(words):
+    return re.compile("|".join(_kw_pattern(w) for w in words), re.IGNORECASE)
+
+
+_STRONG_SIGNAL_RES = {tag: _kw_re(words) for tag, words in STRONG_SIGNALS.items()}
+_STRONG_DEV_RE = _kw_re(STRONG_DEV)
+_WEAK_DEV_RE = _kw_re(WEAK_DEV)
+
 
 # Characters that make up ASCII art.
 ART_CHARS = set("/\\|_-=+*#@~^<>(){}[].:;'\"`")
@@ -154,7 +206,7 @@ def detect_ascii_art(text):
     characters. Commented-out HTML/markup is explicitly excluded - it's
     code, not art."""
     low = text.lower()
-    if any(k in low for k in ("¯\\_(ツ)", "(╯", "ಠ_ಠ", ">_<", "^_^", "o_o")):
+    if any(k in low for k in ("¯\\_(ツ)", "(╯°", "ಠ_ಠ")):   # distinctive kaomoji only
         return True
     if re.search(r"</?\w+[\s/>]", text):          # commented-out markup, not art
         return False
@@ -191,43 +243,44 @@ def classify_comment(raw):
     if _LIB_BANNER_RE.search(low):            # minified library banner
         return None
 
-    words = low.split()
-    wc = len(words)
     tags = []
     score = 0
 
-    for tag, needles in STRONG_SIGNALS.items():
-        if any(n in low for n in needles):
+    # Strong signals (hiring/greeting/easter-egg/credit/confession) auto-keep.
+    for tag, rex in _STRONG_SIGNAL_RES.items():
+        if rex.search(low):
             tags.append(tag)
     if tags:
-        score += 5  # a strong signal is an auto-keep
+        score += 5
 
-    hits = [w for w in DEV_VOICE if w in low]
-    if hits:
+    # Personality / humor vocabulary. One STRONG word is enough on its own;
+    # WEAK words only nudge. This is the whole fight against false positives:
+    # a routine developer doc-comment ("Container that holds slides",
+    # "Preload the fonts") has *none* of these and therefore scores 0 and
+    # drops, even though a human wrote it - it just isn't interesting.
+    strong_hits = len(_STRONG_DEV_RE.findall(low))
+    if strong_hits:
         tags.append("dev-voice")
-        score += min(len(hits), 3)
+        score += min(3 * strong_hits, 6)
+    score += min(len(_WEAK_DEV_RE.findall(low)), 2)
 
-    if any(k in collapsed for k in KAOMOJI) or any(k in low for k in KAOMOJI):
+    if EMOTICON_RE.search(" " + collapsed + " ") or has_emoji(text):
         tags.append("emoticon")
+        score += 3
+
+    # Excitement/frustration punctuation and first-person voice - weak on
+    # their own (so they can't carry a boring sentence past the bar), but
+    # they tip a borderline-human comment over.
+    if re.search(r"\?!|!\?|\?\?|!!", text):
         score += 2
-
-    if wc >= 4:
+    elif "!" in text:
         score += 1
-    if wc >= 9:
+    if re.search(r"\bi\b|\bi'm\b|\bim\b|\bmy\b|\bme\b|\bmyself\b", low):
         score += 1
-    if re.search(r"[a-z].*[.!?]", low) and wc >= 5:
-        score += 1              # reads like an actual sentence
-    if re.search(r"\b(i|we|you|my|our|your|me|us)\b", low):
-        score += 1
-
-    # A short fragment with no human signal at all is almost certainly a
-    # section marker ("main content", "end sidebar") - drop it.
-    if not tags and wc <= 4:
-        return None
 
     if score < KEEP_THRESHOLD:
         return None
-    return ("html_comment", score, tags or ["prose"])
+    return ("html_comment", score, tags or ["note"])
 
 
 # Inline console.* greetings (console.log("👋 we're hiring!"), the %c
@@ -235,6 +288,27 @@ def classify_comment(raw):
 _CONSOLE_RE = re.compile(
     r"""console\.(?:log|info|warn|error)\s*\(\s*(['"`])(.*?)\1""",
     re.DOTALL,
+)
+
+
+# Console output is overwhelmingly operational logging, not Easter eggs.
+# These substrings mark a message as routine log/debug/error noise - drop it.
+_CONSOLE_NOISE = (
+    "error", "failed", "fail ", "unable", "could not", "couldn't", "cannot",
+    "can't", "not found", "not supported", "not defined", "not available",
+    "undefined", "null", "invalid", "missing", "deprecated", "warning:",
+    "exception", "retry", "timeout", "timed out", "loading", "loaded",
+    "init", "debug", "trace", "stack", "fetch", "parse", "parsing",
+    "hydrat", "assigning", "connect", "disconnect", "websocket",
+    "service worker", "script load", "request", "response", "unexpected",
+)
+# ...and these mark one as a deliberate greeting/egg - keep it.
+_CONSOLE_EGG_WORDS = (
+    "hiring", "we're hiring", "we are hiring", "join us", "join the",
+    "careers", "jobs@", "come work", "work with us", "self-xss", "self xss",
+    "don't paste", "do not paste", "stop!", "scam", "attackers",
+    "welcome to", "hello there", "psst", "easter egg", "konami",
+    "nothing to see here", "curious", "snoop", "we love", "built with",
 )
 
 
@@ -247,18 +321,23 @@ def extract_console_eggs(soup):
         if "console" not in code:
             continue
         for _q, msg in _CONSOLE_RE.findall(code):
-            msg = msg.strip()
-            low = msg.lower()
-            clean = msg.replace("%c", "").strip()
-            interesting = (
-                any(k in low for k in (
-                    "hiring", "stop", "warning", "wait", "hello", "hey",
-                    "welcome", "hi ", "self-xss", "self xss", "scam", "join",
-                    "careers", "console", "developer", "psst", "secret",
-                    "🛑", "👋", "✋", "⚠", "🚀", "❤", "👀"))
-                or (len(clean) >= 18 and " " in clean and "%c" not in msg[:3])
+            clean = re.sub(r"%[a-z]", "", msg).strip()
+            low = clean.lower()
+            if len(clean) < 8:
+                continue
+            if "${" in msg or "' +" in msg or '" +' in msg or "`+" in msg:
+                continue                                   # logging a variable
+            if any(n in low for n in _CONSOLE_NOISE):
+                continue                                   # routine log line
+            styled = "%c" in msg
+            keep = (
+                any(k in low for k in _CONSOLE_EGG_WORDS)
+                or has_emoji(clean)
+                or (styled and re.search(r"[a-z]{3,}\s+[a-z]{3,}", low)
+                    and any(k in low for k in ("welcome", "hello", "hey ", "we ",
+                                               "you ", "job", "hire", "made", "love")))
             )
-            if interesting and len(clean) >= 4:
+            if keep:
                 out.append(clean)
     return out
 
@@ -266,7 +345,10 @@ def extract_console_eggs(soup):
 # Response headers worth keeping: the known memorials/jokes, plus any odd
 # X- header whose value reads like a sentence (and isn't boring plumbing).
 BORING_HEADER_VALUE_HINTS = ("gzip", "max-age", "charset", "nosniff", "deny",
-                             "sameorigin", "no-cache", "bytes", "keep-alive")
+                             "sameorigin", "no-cache", "bytes", "keep-alive",
+                             "miss", "hit", "stale", "bypass", "tcp_", "akamai",
+                             "deploy", "varnish", "cloudfront", "fastly", "pop",
+                             "edge", "origin", "upstream")
 BORING_HEADERS = {
     "x-powered-by", "x-frame-options", "x-content-type-options",
     "x-xss-protection", "x-cache", "x-served-by", "x-request-id",
@@ -275,6 +357,8 @@ BORING_HEADERS = {
     "x-amz-cf-id", "x-amz-cf-pop", "x-amz-request-id", "x-github-request-id",
     "x-cdn", "x-edge-location", "x-download-options", "x-permitted-cross-domain-policies",
     "x-dns-prefetch-control", "x-redirect-by", "x-pingback", "x-robots-tag",
+    "x-cache-remote", "x-ac", "x-nc", "x-served", "x-server", "x-backend",
+    "x-cache-status", "x-cacheable", "x-proxy-cache", "x-rq", "x-litespeed-cache",
 }
 
 
@@ -333,7 +417,16 @@ KIND_LABELS = {
 }
 
 
-def _find_key(kind, text):
+def _find_key(kind, text, domain=""):
+    # humans.txt files share the standard "# humanstxt.org/ #..." template
+    # header, so a text-prefix key would collide across different sites and
+    # throw away real credits. Dedup it per domain instead (one per site).
+    if kind == "humans_txt":
+        return "humans_txt\x00" + domain
+    return _find_key_text(kind, text)
+
+
+def _find_key_text(kind, text):
     return kind + "\x00" + _collapse(text).lower()[:300]
 
 
@@ -366,7 +459,7 @@ class FindStore:
                     rec = json.loads(line)
                 except Exception:
                     continue
-                self.seen.add(_find_key(rec["kind"], rec["text"]))
+                self.seen.add(_find_key(rec["kind"], rec["text"], rec.get("domain", "")))
                 self.finds.append(rec)
                 self.per_domain[rec["domain"]] = self.per_domain.get(rec["domain"], 0) + 1
 
@@ -374,14 +467,14 @@ class FindStore:
         self.log_f = self.log_path.open("a", encoding="utf-8")
         self.added_this_run = 0
 
-    def already_have(self, kind, text):
-        return _find_key(kind, text) in self.seen
+    def already_have(self, kind, text, domain=""):
+        return _find_key(kind, text, domain) in self.seen
 
     def domain_count(self, domain):
         return self.per_domain.get(domain, 0)
 
     def add(self, kind, text, url, domain, score, tags):
-        key = _find_key(kind, text)
+        key = _find_key(kind, text, domain)
         if key in self.seen:
             return False
         self.seen.add(key)
@@ -594,6 +687,7 @@ def harvest(seeds, args, store):
     session = requests.Session()
     visited = load_visited(args.output_dir)
     per_domain_pages = {}
+    rooted = set()          # domains whose homepage we've already queued
     queue = deque()
     for leftover in load_frontier(frontier_path(args.output_dir)):
         n = normalize_for_frontier(leftover)
@@ -629,6 +723,18 @@ def harvest(seeds, args, store):
             visited_f.flush()
             pages += 1
             per_domain_pages[netloc] = per_domain_pages.get(netloc, 0) + 1
+
+            # Easter eggs cluster on a site's main page, but we often arrive
+            # at a domain via a deep link. The first time we touch any
+            # domain, jump its homepage to the FRONT of the queue so it's
+            # crawled next - otherwise, with a low per-domain cap, we might
+            # spend the whole budget on article pages and never see it.
+            if netloc not in rooted:
+                rooted.add(netloc)
+                root = normalize_for_frontier(f"{urlparse(url).scheme}://{netloc}/")
+                if root != url and root not in visited:
+                    queue.appendleft(root)
+
             print(f"  [{pages}] {url}")
 
             headers = {"User-Agent": random.choice(USER_AGENTS)}
@@ -695,8 +801,11 @@ def main():
     parser.add_argument("inputs", nargs="+", help="Seed URLs, or a single file with one URL per line")
     parser.add_argument("--max-pages", type=int, default=500,
                          help="Total page fetch budget for this run (default 500)")
-    parser.add_argument("--max-pages-per-domain", type=int, default=25,
-                         help="Cap pages fetched per host per run (0 = unlimited, default 25) - keeps it roaming")
+    parser.add_argument("--max-pages-per-domain", type=int, default=5,
+                         help="Cap pages fetched per host per run (0 = unlimited, default 5). Low on purpose: "
+                              "eggs cluster on the homepage (which is always crawled first per domain), so a "
+                              "few pages per site is plenty, and it keeps the crawl hopping to new domains. "
+                              "Use 1 for a homepage-only blitz.")
     parser.add_argument("--max-finds-per-domain", type=int, default=25,
                          help="Cap finds recorded per host (0 = unlimited, default 25) - one quirky site can't flood the gallery")
     parser.add_argument("--delay-min", type=float, default=0.4, help="Min seconds between requests (default 0.4)")

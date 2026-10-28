@@ -480,6 +480,14 @@ each tagged with *why* it was kept. Tune `KEEP_THRESHOLD` and the keyword
 tables at the top of the script to taste - it's built to be tuned on
 whatever you find in the wild.
 
+**Eggs cluster on the homepage**, so every domain's main page is crawled
+first - the moment the roamer touches a new domain (even if it arrived via
+some deep article link), that domain's homepage jumps to the front of the
+queue. `--max-pages-per-domain` (default 5, low on purpose) then stops it
+sinking into any one site, keeping the crawl hopping to new domains. Use
+`--max-pages-per-domain 1` for a homepage-only blitz across as many sites
+as possible.
+
 Three outputs land in `--output-dir`, all written as it goes (safe to
 read mid-crawl): `finds.jsonl` (the durable log, one JSON record per
 find), `comment_hunter.txt` (a plain-text running log), and

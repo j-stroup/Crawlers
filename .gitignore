@@ -14,6 +14,7 @@ test_reports*/
 images/
 # comment_hunter.py outputs
 finds.jsonl
+finds.jsonl.bak
 gallery.html
 chunt_out/
 .chunt_frontier.txt
