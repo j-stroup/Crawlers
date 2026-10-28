@@ -9,5 +9,12 @@ test_reports*/
 *.db-shm
 *.txt
 !requirements.txt
+!hunt_seeds.txt
 .*_state.json
 images/
+# comment_hunter.py outputs
+finds.jsonl
+gallery.html
+chunt_out/
+.chunt_frontier.txt
+.chunt_visited.txt

@@ -1,0 +1,20 @@
+# Starter seeds for comment_hunter.py - large, crawler-tolerant sites that
+# tend to be rich in hand-written comments, humans.txt credits, console
+# greetings, or jokey headers. It only needs a few good on-ramps; from
+# here it roams outward on its own following links. Add your own favorites
+# (personal dev blogs and indie sites are the best hunting grounds).
+#
+#   python comment_hunter.py hunt_seeds.txt --max-pages 5000
+
+https://www.gnu.org/
+https://www.mozilla.org/
+https://developer.mozilla.org/
+https://www.w3.org/
+https://css-tricks.com/
+https://www.smashingmagazine.com/
+https://news.ycombinator.com/
+https://www.theguardian.com/
+https://ghost.org/
+https://www.ietf.org/
+https://blog.codinghorror.com/
+https://www.kickstarter.com/

@@ -325,11 +325,31 @@ frontier the way deep_audit.py does for its much longer crawls.
 
 ## image_scraper.py - download every image on a list of sites
 
-Same crawl mechanics as email_audit.py (same-domain only, politeness
-delay, resumable at the domain level, `--fresh`) but plain
+Same crawl mechanics as email_audit.py (same-domain only unless
+`--allow-external`, politeness delay, `--fresh`) but plain
 breadth-first order instead of the contact-page priority queue - there's
 no equivalent "most likely" page for images, they're everywhere, so
 prioritizing would just mean guessing wrong instead of right.
+
+`--allow-external` follows links off the starting domain too, same
+flag name and behavior as deep_audit.py's - `--max-pages`/`--max-images`
+become one shared budget across every site reached that way, rather
+than per-domain. Images still land under the *original* seed's folder
+under `images/`, not reorganized by whichever site they actually came
+from - same "attribute to the site that referenced it" convention
+deep_audit.py already uses for broken-link findings. Note this doesn't
+add any robots.txt awareness (text_harvester.py has that, for its
+no-boundary wandering) - ask if you want that added here too once
+you're routinely pointing `--allow-external` at sites you don't own.
+
+`--min-width`/`--min-height` (pixels, default 100 each, 0 = no minimum)
+skip images smaller than that - the classic case being nav icons,
+favicons, and tiny UI glyphs cluttering up a batch of otherwise
+meaningful content photos. Dimensions are read directly from the
+PNG/JPEG/GIF header bytes (no imaging library needed, same "parse it
+ourselves" approach as the robots.txt wildcard support in
+text_harvester.py); WEBP/SVG/BMP/ICO can't be measured this way and
+pass through unfiltered rather than being guessed at.
 
 Looks at `<img>` tags only (both `src` and every URL listed in
 `srcset`) - not CSS `background-image`, not favicons, not `og:image`
@@ -350,29 +370,138 @@ identical filename with *different* content get a `-2`, `-3`, ...
 suffix) and writes `images_manifest.txt` - same "written as it goes"
 live log as email_audit_report.txt, listing each image's source URL,
 the page it was found on, and where it landed (or that it was a
-duplicate).
+duplicate). Console output is verbose: every page prints how many
+image references it found and how many are new, then one line per
+image saying whether it was saved, a duplicate, or skipped (and why).
 
 `--max-images` is an additional per-site safety cap (default 300,
 0 = unlimited) alongside `--max-pages` - a single gallery/product page
 can reference far more images than there are pages, so page count
 alone isn't a tight enough budget for disk usage.
 
-`--fresh` here also **deletes** the domain's previously-downloaded
-images under `images/` before starting over, not just the text report -
-otherwise a truly fresh re-run would leave old files mixed in
-alongside new ones with no way to tell them apart.
+**Downloaded images and the manifest accumulate across every normal
+run, indefinitely** - not just during a resumed interrupted run,
+unlike the domain-skip progress tracking below. Running it again
+later for a different site (or even the same one) never touches images
+already on disk from a previous run. Only `--fresh` deletes them, along
+with the manifest, to start completely clean. (Earlier versions tied
+this to the same "resume" state as the domain-skip tracking, which
+meant images silently got wiped on the very first normal run after any
+previous run had fully completed - fixed; the two are unrelated now.)
+
+Domain-level "don't redo a site already fully crawled" tracking still
+works the same way as email_audit.py: finishing the whole domain list
+in one run clears that progress file, so a later run of the same list
+re-crawls those sites' *pages* again from scratch (to pick up anything
+new) - but thanks to the hash dedup above, that never means duplicate
+files pile up on disk.
+
+## text_harvester.py - build a Markov-chain source corpus
+
+**The odd one out: this is the only tool here that is NOT scoped to
+sites you own.** Give it one or more seed URLs and it wanders outward
+with no domain boundary at all - every link it finds anywhere is fair
+game. Collects `<p>` text (skipping anything inside `<nav>`/`<header>`/
+`<footer>`/`<aside>`/`<script>`/`<style>`, and anything shorter than
+`--min-words`) into an ever-growing `corpus.txt`, one paragraph per
+line, meant as raw material for a Markov chain generator.
+
+```
+python text_harvester.py https://example.com --max-pages 500
+python text_harvester.py seeds.txt --max-pages 2000 --max-pages-per-domain 40
+```
+
+Because it goes anywhere, **it respects `robots.txt` by default** -
+the opposite default from every other tool here, which assume you own
+the target. `--ignore-robots` opts out. It uses a from-scratch
+wildcard-aware parser (`WildcardRobots`) rather than Python's own
+`urllib.robotparser`, which doesn't support the `*`/`$` wildcards a
+huge share of real robots.txt files actually use - the stdlib version
+would silently let through rules like `Disallow: /search*`.
+
+There's no domain allowlist, so the only real stopping condition is
+`--max-pages` (default 500, total for the run). `--max-pages-per-domain`
+(default 25, 0 = unlimited) is a diversity safety valve - it caps how
+many of that budget's pages can come from any one host, so a single
+deep site doesn't eat the whole run and crowd out variety. It's also
+this tool's main defense against query-string crawler traps (a
+calendar, a faceted search): unlike the other tools, link URLs here
+are **not** canonicalized to drop their query string, because on the
+arbitrary, often older sites this one wanders onto, a query string
+(`?id=`, `?p=`) is frequently the only thing identifying which distinct
+page it is - stripping it would collapse hundreds of different pages
+into one. A trap host just burns its own per-domain cap and gets
+skipped instead.
+
+**Genuinely ever-growing, not just resumable.** Three things persist
+across separate runs, all reloaded at startup: the corpus itself (for
+paragraph-dedup - the same boilerplate line never gets added twice),
+a visited-URL log (so a page already harvested is never re-fetched),
+and - the part that makes repeat runs actually keep finding new
+material - a frontier file of every URL discovered but not yet
+reached when the previous run hit `--max-pages`. Without that last
+one, re-running with the same seed(s) would find nothing to do the
+moment the seeds themselves are already marked visited; with it, each
+run picks up expanding from wherever the last one's budget ran out.
+`--fresh` discards all three and starts a brand new corpus.
+
+## comment_hunter.py - collect HTML comments & Easter eggs
+
+Same roaming family as `text_harvester.py` (no domain boundary, respects
+`robots.txt` by default, resumable + ever-growing), but instead of body
+text it digs through page **source** for the human things people leave
+behind:
+
+- **HTML comments** written by a person on purpose - jokes, apologies,
+  `TODO`/`FIXME`/"here be dragons", hiring messages, "if you're reading
+  this...", credits ("made with love by..."), confessions.
+- **ASCII art** in comments or kaomoji (`¯\_(ツ)_/¯`).
+- **Console greetings** - the `console.log("we're hiring!")` / styled
+  `%c` banners / self-XSS "Stop!" warnings sites leave in inline scripts.
+- **Jokey response headers** - most famously `X-Clacks-Overhead: GNU
+  Terry Pratchett`, plus any odd `X-` header that reads like a sentence.
+- **humans.txt** - the `/humans.txt` credits file, probed once per host.
+
+```
+python comment_hunter.py https://example.com --max-pages 500
+python comment_hunter.py hunt_seeds.txt --max-pages 5000 --max-pages-per-domain 30
+python comment_hunter.py hunt_seeds.txt --fresh
+```
+
+**The whole trick is the scoring**, because ~99% of HTML comments are
+machine-generated plumbing (`<!-- end header -->`, WordPress `wp:` block
+markers, IE conditionals, analytics snippets, cookie-consent and
+library-attribution banners). Each candidate is hard-filtered against
+those known-boilerplate patterns, then scored on how much it reads like
+a human wrote it (sentence structure, first/second person, dev-voice
+words, and strong signals like hiring/credit/confession/Easter-egg
+vocabulary that auto-keep). Only comments clearing the bar are recorded,
+each tagged with *why* it was kept. Tune `KEEP_THRESHOLD` and the keyword
+tables at the top of the script to taste - it's built to be tuned on
+whatever you find in the wild.
+
+Three outputs land in `--output-dir`, all written as it goes (safe to
+read mid-crawl): `finds.jsonl` (the durable log, one JSON record per
+find), `comment_hunter.txt` (a plain-text running log), and
+**`gallery.html`** - a dark, monospaced gallery with a score-sorted Hall
+of Fame, most-recent feed, and per-type sections. Open it and watch it
+fill up. `hunt_seeds.txt` is a starter list of good on-ramps; personal
+dev blogs and indie sites are the richest hunting grounds.
 
 ## Notes
 
 - All three crawlers (quick_scan, deep_audit, email_audit) rotate
   through a shared pool of real browser user-agent strings
   (`user_agents.py`) instead of sending a default `python-requests/x.x`
-  header; image_scraper does too, since it reuses the same page-fetching
-  code as email_audit.
+  header; image_scraper and text_harvester do too, since they reuse the
+  same page-fetching code as email_audit.
 - The "risky params" and "security-watch status codes" lists are
   heuristics meant to shorten your manual review list, not a claim that
   something is actually vulnerable.
-- Report files, manifests, and downloaded images are all gitignored by
-  default (`*.txt`, `.*_state.json`, `images/`, `reports/`) since
-  reports can contain masked-but-still-sensitive findings and the
-  others are regenerable run output, not source.
+- Report files, manifests, downloaded images, and the text-harvester's
+  corpus/state files are all gitignored by default (`*.txt`,
+  `.*_state.json`, `images/`, `reports/`) since reports can contain
+  masked-but-still-sensitive findings and the others are regenerable
+  (or in corpus.txt's case, personal/accumulated) run output, not
+  source - if you want the corpus itself backed up somewhere, do that
+  deliberately rather than via this repo.

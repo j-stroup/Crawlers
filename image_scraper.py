@@ -23,6 +23,7 @@ import json
 import mimetypes
 import random
 import shutil
+import struct
 import sys
 import time
 from collections import deque
@@ -56,11 +57,40 @@ def extract_srcset_urls(base_url, soup):
     return urls
 
 
+# Content-types where the URL's own extension can't be trusted - CDNs
+# commonly serve a different format than the path implies via a query
+# param (Contentful/imgix/Cloudinary-style "?fm=webp" on a path that
+# still ends in .jpg). The first entry is used when renaming.
+CONTENT_TYPE_EXTENSIONS = {
+    "image/jpeg": (".jpg", ".jpeg", ".jfif"),
+    "image/png": (".png",),
+    "image/webp": (".webp",),
+    "image/gif": (".gif",),
+    "image/svg+xml": (".svg",),
+    "image/avif": (".avif",),
+    "image/bmp": (".bmp",),
+    "image/x-icon": (".ico",),
+    "image/vnd.microsoft.icon": (".ico",),
+    "image/tiff": (".tiff", ".tif"),
+}
+
+
 def guess_filename(url, content_type):
+    """Names the file after the URL's own filename, but corrects the
+    extension when it doesn't match what the server actually sent - a
+    path can keep its original ".jpg" even when a CDN query param (e.g.
+    "?fm=webp") makes it actually serve webp bytes."""
     name = Path(urlparse(url).path).name or "image"
-    if "." not in name:
-        ext = mimetypes.guess_extension((content_type or "").split(";")[0].strip()) or ""
-        name += ext
+    stem = Path(name).stem or "image"
+    current_ext = Path(name).suffix.lower()
+
+    mime = (content_type or "").split(";")[0].strip().lower()
+    acceptable = CONTENT_TYPE_EXTENSIONS.get(mime)
+
+    if acceptable and current_ext not in acceptable:
+        return stem + acceptable[0]
+    if not current_ext:
+        return stem + (acceptable[0] if acceptable else (mimetypes.guess_extension(mime) or ""))
     return name
 
 
@@ -80,6 +110,47 @@ def unique_path(dest_dir, filename):
         n += 1
 
 
+def get_image_dimensions(body):
+    """Reads width/height straight out of a raster image's own header
+    bytes - no decode, no imaging library dependency, just the same
+    "parse it ourselves" approach already used for robots.txt in
+    text_harvester.py. Returns None for formats this doesn't recognize
+    (WEBP, SVG, BMP, ICO, ...) - those are let through the size filter
+    unmeasured rather than guessed at, since a wrong guess would be
+    worse than no guess."""
+    if body[:8] == b"\x89PNG\r\n\x1a\n":
+        if len(body) < 24:
+            return None
+        width, height = struct.unpack(">II", body[16:24])
+        return width, height
+
+    if body[:3] == b"\xff\xd8\xff":
+        i = 2
+        while i < len(body) - 9:
+            if body[i] != 0xFF:
+                i += 1
+                continue
+            marker = body[i + 1]
+            if marker in (0xD8, 0xD9) or 0xD0 <= marker <= 0xD7:
+                i += 2
+                continue
+            seg_len = struct.unpack(">H", body[i + 2:i + 4])[0]
+            if marker in (0xC0, 0xC1, 0xC2, 0xC3, 0xC5, 0xC6, 0xC7,
+                          0xC9, 0xCA, 0xCB, 0xCD, 0xCE, 0xCF):
+                height, width = struct.unpack(">HH", body[i + 5:i + 9])
+                return width, height
+            i += 2 + seg_len
+        return None
+
+    if body[:6] in (b"GIF87a", b"GIF89a"):
+        if len(body) < 10:
+            return None
+        width, height = struct.unpack("<HH", body[6:10])
+        return width, height
+
+    return None
+
+
 def download_image(session, url, headers, timeout, max_fetch_seconds):
     """Same streamed GET + hard wall-clock deadline as fetch_page, but
     returns raw bytes instead of decoding as text - decoding binary
@@ -97,7 +168,7 @@ def download_image(session, url, headers, timeout, max_fetch_seconds):
 
 
 def crawl_domain(start_url, delay_min, delay_max, max_pages, max_images, timeout, max_fetch_seconds,
-                  dest_dir, seen_hashes, on_image):
+                  dest_dir, seen_hashes, on_image, min_width=0, min_height=0, allow_external=False):
     netloc = urlparse(start_url).netloc
     session = requests.Session()
 
@@ -120,35 +191,51 @@ def crawl_domain(start_url, delay_min, delay_max, max_pages, max_images, timeout
         if url in visited:
             continue
         visited.add(url)
-        print(f"  [{len(visited)}] {url}")
+        print(f"  [{len(visited)}] {url}  ({downloaded} image(s) saved so far)")
 
         headers = {"User-Agent": random.choice(USER_AGENTS)}
         try:
             final_url, status, content_type, text = fetch_page(session, url, headers, timeout, max_fetch_seconds)
         except Exception as exc:
-            print(f"  [ERROR] {url}: {exc}")
+            print(f"      [ERROR] {exc}")
             time.sleep(random.uniform(delay_min, delay_max))
             continue
         time.sleep(random.uniform(delay_min, delay_max))
 
-        if status >= 400 or "html" not in content_type:
+        if status >= 400:
+            print(f"      skipped page, HTTP {status}")
+            continue
+        if "html" not in content_type:
+            print(f"      skipped page, not HTML ({content_type or 'no content-type'})")
             continue
 
         try:
             soup = BeautifulSoup(text, "html.parser")
-        except Exception:
+        except Exception as exc:
+            print(f"      [ERROR] couldn't parse page HTML: {exc}")
             continue
 
         page_links, resource_links = extract_links(final_url, soup)
         image_urls = [u for u, kind in resource_links if kind == "image"]
         image_urls += extract_srcset_urls(final_url, soup)
 
+        # Dedup against both this domain's history AND repeats within
+        # this same page (e.g. the same image used in two different
+        # layout spots) - without the second part, a same-page repeat
+        # would get fetched twice before the first fetch's result could
+        # mark it seen.
+        new_image_urls = []
         for image_url in image_urls:
+            if image_url not in seen_image_urls:
+                seen_image_urls.add(image_url)
+                new_image_urls.append(image_url)
+        print(f"      {len(image_urls)} image reference(s) on this page "
+              f"({len(new_image_urls)} not seen on this domain yet), {len(page_links)} link(s) to follow")
+
+        for image_url in new_image_urls:
             if max_images and downloaded >= max_images:
+                print(f"      reached --max-images limit ({max_images}), not fetching the rest of this page's images")
                 break
-            if image_url in seen_image_urls:
-                continue
-            seen_image_urls.add(image_url)
 
             img_headers = {"User-Agent": random.choice(USER_AGENTS)}
             try:
@@ -156,16 +243,26 @@ def crawl_domain(start_url, delay_min, delay_max, max_pages, max_images, timeout
                     session, image_url, img_headers, timeout, max_fetch_seconds
                 )
             except Exception as exc:
-                print(f"  [IMG ERROR] {image_url}: {exc}")
+                print(f"      [IMG ERROR] {image_url}: {exc}")
                 time.sleep(random.uniform(delay_min, delay_max))
                 continue
             time.sleep(random.uniform(delay_min, delay_max))
 
-            if img_status >= 400 or not img_content_type.startswith(IMAGE_CONTENT_TYPE_PREFIX):
+            if img_status >= 400:
+                print(f"      -> skip, HTTP {img_status}: {image_url}")
+                continue
+            if not img_content_type.startswith(IMAGE_CONTENT_TYPE_PREFIX):
+                print(f"      -> skip, not an image ({img_content_type or 'no content-type'}): {image_url}")
+                continue
+
+            dims = get_image_dimensions(body)
+            if dims and ((min_width and dims[0] < min_width) or (min_height and dims[1] < min_height)):
+                print(f"      -> skip, too small ({dims[0]}x{dims[1]}): {image_url}")
                 continue
 
             digest = hashlib.sha256(body).hexdigest()
             if digest in seen_hashes:
+                print(f"      -> duplicate content, not re-saved: {image_url}")
                 on_image(image_url, url, None, duplicate=True)
                 continue
 
@@ -173,11 +270,12 @@ def crawl_domain(start_url, delay_min, delay_max, max_pages, max_images, timeout
             saved_path.write_bytes(body)
             seen_hashes.add(digest)
             downloaded += 1
+            print(f"      -> saved {saved_path.name} ({len(body) / 1024:.1f} KB): {image_url}")
             on_image(image_url, url, saved_path, duplicate=False)
 
         for link in page_links:
             link = canonicalize(link)
-            if same_domain(link, netloc) and link not in found_on:
+            if (allow_external or same_domain(link, netloc)) and link not in found_on:
                 found_on[link] = url
                 queue.append(link)
 
@@ -207,31 +305,42 @@ def save_completed_domains(outdir, completed):
 class Manifest:
     """Tracks what's been downloaded and writes a running log, mirroring
     email_audit.py's LiveWriter: flushes after every write so an
-    interrupted run doesn't lose the record of what it already saved,
-    and in resume mode hashes everything already on disk so a
-    re-crawled domain won't re-save (or re-count as new) an image it
-    already has."""
+    interrupted run doesn't lose the record of what it already saved.
 
-    def __init__(self, outdir, resume):
+    Downloaded images and the manifest persist and accumulate across
+    EVERY normal run, the same as text_harvester.py's corpus.txt - not
+    just during a resumed (interrupted-run) one. Whether a previous run
+    finished cleanly or got interrupted has no bearing on this; only an
+    explicit --fresh wipes them. (Domain-level skip-if-already-done is
+    a separate, unrelated decision driven by the completed-domains
+    state file - that one DOES still reset after a clean full
+    completion, same as email_audit.py, so a later re-run of the same
+    domain list will re-crawl its pages again rather than skip them -
+    but it was never this class's job to delete anything on that
+    basis, which is the bug this replaced.)"""
+
+    def __init__(self, outdir, fresh):
         outdir = Path(outdir)
         outdir.mkdir(parents=True, exist_ok=True)
         self.images_dir = outdir / "images"
+        self.manifest_path = outdir / "images_manifest.txt"
 
-        if not resume and self.images_dir.is_dir():
-            shutil.rmtree(self.images_dir)
+        if fresh:
+            if self.images_dir.is_dir():
+                shutil.rmtree(self.images_dir)
+            if self.manifest_path.is_file():
+                self.manifest_path.unlink()
         self.images_dir.mkdir(parents=True, exist_ok=True)
 
-        self.manifest_path = outdir / "images_manifest.txt"
         self.seen_hashes = set()
-        if resume:
-            for existing in self.images_dir.rglob("*"):
-                if existing.is_file():
-                    self.seen_hashes.add(hashlib.sha256(existing.read_bytes()).hexdigest())
+        for existing in self.images_dir.rglob("*"):
+            if existing.is_file():
+                self.seen_hashes.add(hashlib.sha256(existing.read_bytes()).hexdigest())
 
-        mode = "a" if resume else "w"
-        self.manifest_f = self.manifest_path.open(mode, encoding="utf-8")
-        if resume:
-            self.manifest_f.write(f"\n--- resuming at {datetime.now().isoformat(timespec='seconds')} ---\n\n")
+        appending = self.manifest_path.is_file()
+        self.manifest_f = self.manifest_path.open("a" if appending else "w", encoding="utf-8")
+        if appending:
+            self.manifest_f.write(f"\n--- run started at {datetime.now().isoformat(timespec='seconds')} ---\n\n")
         else:
             self.manifest_f.write("Image Scrape Manifest\n")
             self.manifest_f.write(f"Generated: {datetime.now().isoformat(timespec='seconds')}\n")
@@ -292,7 +401,10 @@ def main():
     parser.add_argument("--timeout", type=int, default=10, help="Per-request connect/read timeout in seconds (default 10)")
     parser.add_argument("--max-fetch-seconds", type=float, default=30, help="Hard wall-clock cap per request regardless of how slowly the server sends data (default 30)")
     parser.add_argument("--output-dir", default=".", help="Directory to save images and the manifest into (default: current dir)")
-    parser.add_argument("--fresh", action="store_true", help="Ignore any saved progress from an interrupted run, delete previously downloaded images, and start the whole list over")
+    parser.add_argument("--fresh", action="store_true", help="Delete all previously downloaded images and the manifest, ignore any saved domain-completion progress, and start the whole list over. Without this, images always accumulate across runs.")
+    parser.add_argument("--min-width", type=int, default=100, help="Skip images narrower than this many pixels (0 = no minimum, default 100). Only enforced for formats whose dimensions can be read without a decode (PNG/JPEG/GIF) - WEBP/SVG/BMP/ICO pass through unmeasured.")
+    parser.add_argument("--min-height", type=int, default=100, help="Skip images shorter than this many pixels (0 = no minimum, default 100). Same format caveat as --min-width.")
+    parser.add_argument("--allow-external", action="store_true", help="Follow links off the starting domain too, same as deep_audit.py's flag of the same name - --max-pages/--max-images are a single shared budget across every site reached this way, images still land under the ORIGINAL seed's folder")
     args = parser.parse_args()
 
     domains = load_domains(args.inputs)
@@ -301,7 +413,7 @@ def main():
     if resume:
         print(f"Resuming - {len(completed)} domain(s) already completed will be skipped.")
 
-    manifest = Manifest(args.output_dir, resume=resume)
+    manifest = Manifest(args.output_dir, fresh=args.fresh)
     started = time.time()
     completed_fully = False
 
@@ -324,6 +436,7 @@ def main():
             visited, downloaded = crawl_domain(
                 start_url, args.delay_min, args.delay_max, args.max_pages, args.max_images,
                 args.timeout, args.max_fetch_seconds, dest_dir, manifest.seen_hashes, on_image,
+                min_width=args.min_width, min_height=args.min_height, allow_external=args.allow_external,
             )
             manifest.finish_domain(len(visited), downloaded)
             print(f"  {len(visited)} page(s) crawled, {downloaded} image(s) downloaded")
