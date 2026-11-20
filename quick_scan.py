@@ -97,6 +97,17 @@ def check_only(session, url):
         return exc
 
 
+def _safe_join(base, ref):
+    """urljoin + fragment-strip that never raises. A malformed href - e.g. an
+    unbalanced '[' that urllib misreads as an IPv6 literal ('Invalid IPv6
+    URL') - must skip that one link, not crash an entire (possibly days-long)
+    crawl."""
+    try:
+        return urljoin(base, ref).split("#")[0]
+    except Exception:
+        return None
+
+
 def extract_links(url, soup):
     """Returns (page_links, resource_links) found on an HTML page.
 
@@ -107,21 +118,29 @@ def extract_links(url, soup):
     """
     page_links = set()
     for tag in soup.find_all("a", href=True):
-        link = urljoin(url, tag["href"]).split("#")[0]
-        if link.startswith(("http://", "https://")):
+        link = _safe_join(url, tag["href"])
+        if link and link.startswith(("http://", "https://")):
             page_links.add(link)
 
     resource_links = []
     for tag in soup.find_all("img", src=True):
-        resource_links.append((urljoin(url, tag["src"]).split("#")[0], "image"))
+        u = _safe_join(url, tag["src"])
+        if u:
+            resource_links.append((u, "image"))
     for tag in soup.find_all("link", href=True):
         rel = " ".join(tag.get("rel", [])).lower()
         if "stylesheet" in rel or "icon" in rel:
-            resource_links.append((urljoin(url, tag["href"]).split("#")[0], "stylesheet"))
+            u = _safe_join(url, tag["href"])
+            if u:
+                resource_links.append((u, "stylesheet"))
     for tag in soup.find_all("iframe", src=True):
-        resource_links.append((urljoin(url, tag["src"]).split("#")[0], "iframe"))
+        u = _safe_join(url, tag["src"])
+        if u:
+            resource_links.append((u, "iframe"))
     for tag in soup.find_all("script", src=True):
-        resource_links.append((urljoin(url, tag["src"]).split("#")[0], "script"))
+        u = _safe_join(url, tag["src"])
+        if u:
+            resource_links.append((u, "script"))
 
     resource_links = [(u, k) for u, k in resource_links if u.startswith(("http://", "https://"))]
     return page_links, resource_links

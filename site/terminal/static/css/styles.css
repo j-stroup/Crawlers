@@ -1,0 +1,147 @@
+html, body {
+    background-color: #000;
+    margin: 0;
+    padding: 0;
+    height: 100%;
+    /* This prevents the "double" scrollbar by hiding the browser's default one */
+    overflow: hidden; 
+}
+/* Color Classes to circumvent strict production CSP rules */
+.user-guest { color: #00FF41; }
+.user-root { 
+    color: #ff5555 !important; 
+    text-shadow: none !important; /* Or use: 0 0 4px rgba(255, 85, 85, 0.65) */
+}
+.output-text { color: #00FF41; }
+.output-white { color: #ffffff; }
+.history-command { color: #ffffff; margin-left: 5px; }
+.user-guest { color: #00FF41 !important; }
+.user-root { color: #ff5555 !important; }
+
+.fs-directory { 
+    color: #5DADE2 !important; 
+    font-weight: bold;
+    text-shadow: none !important; /* Strips the mismatched glow */
+}
+.fs-file { color: #ffffff !important; }
+
+#terminal-container {
+    color: #00FF41;
+    font-family: 'Courier New', Courier, monospace;
+    padding: 20px;
+    height: 100vh; /* Fill the whole screen */
+    box-sizing: border-box;
+    /* This becomes your primary and only scrollbar */
+    overflow-y: auto; 
+    display: block; /* Change from flex to block to prevent centering */
+    text-align: left; /* Explicitly align everything left */
+    flex-direction: column;
+    text-shadow: 0 0 5px #C8FFC8;
+}
+
+/* Optional: Make the scrollbar look more "terminal-like" */
+#terminal-container::-webkit-scrollbar {
+    width: 8px;
+}
+#terminal-container::-webkit-scrollbar-track {
+    background: #000;
+}
+#terminal-container::-webkit-scrollbar-thumb {
+    background: #004400;
+    border-radius: 4px;
+}
+#terminal-container::-webkit-scrollbar-thumb:hover {
+    background: #00FF41;
+}
+/* Kernel panic alignment utility to fix line 122 CSP blocks */
+.panic-container {
+    text-align: center;
+    padding: 40px;
+}
+#history {
+    display: block; /* Changed from inline to block */
+    white-space: pre-wrap;
+    width: 100%;
+}
+
+.history-item {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    margin: 0;        /* Force zero margin */
+    padding: 0;       /* Force zero padding */
+    line-height: 1.2; /* Tighten line height */
+    width: 100%;
+}
+
+.output {
+    display: block;
+    width: 100%;
+    margin: 0;
+    padding: 0;
+    white-space: pre-wrap; /* This makes the multi-line echo work! */
+    line-height: 1.2;
+    color: #00FF41; /* Ensure output stays terminal green */
+}
+
+.input-row {
+    display: flex;
+    width: 100%;
+    margin: 0;
+    padding: 0;
+}
+
+#cmd {
+    background: transparent;
+    border: none;
+    color: #fff;
+    font-family: inherit;
+    font-size: inherit;
+    outline: none;
+    flex: 1; /* Takes up the remaining space on the line */
+    padding: 0;
+    margin: 0;
+}
+
+#prompt {
+    color: #00FF41;
+    white-space: nowrap;
+    margin-right: 8px;
+}
+
+
+
+/* Scanline effect */
+body::after {
+    content: " ";
+    display: block;
+    position: fixed; /* Fixed so it stays over the screen while scrolling */
+    top: 0; left: 0; bottom: 0; right: 0;
+    background: linear-gradient(rgba(18, 16, 16, 0) 50%, rgba(0, 0, 0, 0.1) 50%), 
+                linear-gradient(90deg, rgba(255, 0, 0, 0.03), rgba(0, 255, 0, 0.01), rgba(0, 0, 255, 0.03));
+    z-index: 10;
+    background-size: 100% 2px, 3px 100%;
+    pointer-events: none;
+}
+#cmd {
+    caret-color: #00FF41; /* The cursor color */
+}
+
+/* For a classic block cursor (Chrome/Edge/Safari) */
+#cmd {
+    caret-shape: block; 
+}
+
+/* For Firefox or older browsers, we use a custom animation on a span */
+.cursor {
+    display: inline-block;
+    width: 10px;
+    height: 1.2em;
+    background-color: #00FF41;
+    animation: blink 1s step-end infinite;
+    vertical-align: middle;
+}
+
+@keyframes blink {
+    50% { opacity: 0; }
+}

@@ -1,0 +1,2 @@
+# The command log is written server-side only; never serve it over the web.
+Require all denied

@@ -491,10 +491,30 @@ as possible.
 Three outputs land in `--output-dir`, all written as it goes (safe to
 read mid-crawl): `finds.jsonl` (the durable log, one JSON record per
 find), `comment_hunter.txt` (a plain-text running log), and
-**`gallery.html`** - a dark, monospaced gallery with a score-sorted Hall
-of Fame, most-recent feed, and per-type sections. Open it and watch it
-fill up. `hunt_seeds.txt` is a starter list of good on-ramps; personal
-dev blogs and indie sites are the richest hunting grounds.
+**`gallery.html`** - a dark, monospaced terminal-style gallery (CRT
+scanlines, glitch title, filter-by-type and sort-by-score/newest/oldest).
+Open it and watch it fill up. `hunt_seeds.txt` is a starter list of good
+on-ramps; personal dev blogs and indie sites are the richest hunting
+grounds.
+
+### Publishing it (the `site/` folder)
+
+`--public` writes a redacted, publish-safe `public_finds.json`: emails are
+masked to their domain, IP addresses stripped, and **any find that
+contained a real secret/key is dropped entirely** - the raw `finds.jsonl`
+(which may hold unredacted emails) never leaves your machine.
+
+```
+python comment_hunter.py hunt_seeds.txt --public
+```
+
+`site/` is a small PHP app (flat files + SQLite, no framework) that serves
+that data as the same terminal-style gallery plus an **about** page and a
+per-find **like** button. Deploy: edit `site/config.php` (your
+removal-request contact), upload `site/`, copy your `public_finds.json`
+into `site/data/`, and make `data/` writable. Full steps in
+`site/README.md`. Likes use stable per-find content-hash ids, so they
+persist when you refresh the dataset. Needs PHP 7.4+/8 with `pdo_sqlite`.
 
 ## Notes
 

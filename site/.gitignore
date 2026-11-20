@@ -1,0 +1,4 @@
+data/votes.sqlite
+data/votes.sqlite-wal
+data/votes.sqlite-shm
+data/public_finds.json

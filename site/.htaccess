@@ -1,0 +1,27 @@
+# Custom 404 page (keeps the terminal look + sends a lost visitor back home).
+ErrorDocument 404 /404.php
+
+# Force every request onto HTTPS (addon domains can't use cPanel's toggle).
+RewriteEngine On
+RewriteCond %{HTTPS} !=on
+RewriteRule ^ https://%{HTTP_HOST}%{REQUEST_URI} [L,R=301]
+
+# Pretty permalinks for a single find: /find/<id> -> find.php?id=<id>
+RewriteRule ^find/([a-fA-F0-9]{8,32})/?$ find.php?id=$1 [L,QSA]
+
+# RSS feed at a clean path
+RewriteRule ^feed\.xml$ feed.php [L]
+
+# XML sitemap at a clean path
+RewriteRule ^sitemap\.xml$ sitemap.php [L]
+
+# Paginated full archive: /archive and /archive/<n>
+RewriteRule ^archive/?$ archive.php [L]
+RewriteRule ^archive/([0-9]+)/?$ archive.php?p=$1 [L]
+
+# Never serve the likes database (or its temp files) over the web - it's
+# read server-side by PHP only. Without this, anyone could download
+# data/votes.sqlite directly.
+<FilesMatch "\.(sqlite|sqlite-journal|sqlite-wal|sqlite-shm)$">
+  Require all denied
+</FilesMatch>
