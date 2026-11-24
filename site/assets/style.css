@@ -145,6 +145,17 @@ a.lbl:hover { text-decoration:underline; }
 .pager .pg { color:var(--dim); }
 @media (max-width:560px) { .statrow .lbl { width:120px; } }
 
+/* search */
+.searchbar { display:flex; gap:8px; flex-wrap:wrap; align-items:center; margin:0 0 18px; }
+.searchbar input { flex:1 1 240px; min-width:0; font:15px var(--mono); color:var(--ink);
+  background:rgba(2,16,7,.7); border:1px solid var(--dim); border-radius:4px; padding:9px 11px; }
+.searchbar input::placeholder { color:var(--dim); }
+.searchbar input:focus { outline:none; border-color:var(--green); box-shadow:var(--glow); }
+.searchbar button { cursor:pointer; font:14px var(--mono); color:var(--green2);
+  background:rgba(2,16,7,.7); border:1px solid var(--dim); border-radius:4px; padding:9px 16px; }
+.searchbar button:hover { border-color:var(--green); color:var(--green); }
+mark { background:var(--amber); color:#03230f; border-radius:2px; padding:0 1px; text-shadow:none; }
+
 .k-header { border-left-color:var(--amber); } .k-header .kind { color:var(--amber); }
 .k-humans_txt { border-left-color:var(--cyan); } .k-humans_txt .kind { color:var(--cyan); }
 .k-ascii_art { border-left-color:var(--magenta); } .k-ascii_art .kind { color:var(--magenta); }

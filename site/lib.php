@@ -172,8 +172,17 @@ function find_snippet($f, $max = 180) {
     return $t;
 }
 
-// Shared find-card markup, used by both the gallery and the single-find page.
-function render_card($f, $lk, $is_new = false) {
+// Wrap occurrences of a search term in <mark>. Both the haystack and needle are
+// already HTML-escaped, so injecting the literal <mark> tags is safe (no XSS).
+function hl_mark($escaped, $q) {
+    $q = trim((string)$q);
+    if ($q === '') return $escaped;
+    return preg_replace('/' . preg_quote(h($q), '/') . '/iu', '<mark>$0</mark>', $escaped);
+}
+
+// Shared find-card markup, used by the gallery, the single-find page and search.
+// $hl, when set, highlights that term inside the find text and domain.
+function render_card($f, $lk, $is_new = false, $hl = '') {
     $kind  = $f['kind'] ?? 'html_comment';
     $label = strtoupper(KIND_LABELS[$kind] ?? $kind);
     $id    = $f['id'] ?? '';
@@ -185,9 +194,9 @@ function render_card($f, $lk, $is_new = false) {
         <?php if ($is_new): ?><span class="tag new">new</span><?php endif; ?>
         <?php foreach (($f['tags'] ?? []) as $t): ?><span class="tag"><?= h($t) ?></span><?php endforeach; ?>
         <span class="score">::<?= (int)($f['score'] ?? 0) ?></span></div>
-      <pre><?= h($f['text'] ?? '') ?></pre>
+      <pre><?= hl_mark(h($f['text'] ?? ''), $hl) ?></pre>
       <div class="src"><span class="arr">&gt;&gt;</span>
-        <a href="<?= h($f['url'] ?? '#') ?>" target="_blank" rel="noopener noreferrer nofollow"><?= h($f['domain'] ?? '') ?></a>
+        <a href="<?= h($f['url'] ?? '#') ?>" target="_blank" rel="noopener noreferrer nofollow"><?= hl_mark(h($f['domain'] ?? ''), $hl) ?></a>
         <?php $seen = (int)($f['seen_on'] ?? 1); if ($seen > 1): ?><span class="seen">seen on <?= $seen ?> sites</span><?php endif; ?>
         <button class="like" type="button" data-id="<?= h($id) ?>">&#9650; <span class="lc"><?= (int)$lk ?></span></button>
         <button class="permalink" type="button" data-id="<?= h($id) ?>" title="copy a link to this find">link</button>

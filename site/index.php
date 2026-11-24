@@ -38,6 +38,12 @@ require __DIR__ . '/partials/head.php';
   </div>
 <?php endif; ?>
 
+  <form class="searchbar" method="get" action="/search" role="search">
+    <input name="q" type="search" placeholder="search every find &amp; the domains they're from&hellip;"
+           autocomplete="off" spellcheck="false">
+    <button type="submit">search</button>
+  </form>
+
   <h2><span class="pr">root@v0rt</span><span class="pa">:~/finds</span># <span class="cmd">./loot --browse</span></h2>
 
   <div class="toolbar"><span class="tlbl">filter:</span>

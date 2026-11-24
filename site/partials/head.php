@@ -31,7 +31,7 @@ $cfg = cfg();
 <title><?= h($title) ?></title>
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="description" content="<?= h($og_desc) ?>">
-<meta name="robots" content="index,follow">
+<meta name="robots" content="<?= h($robots ?? 'index,follow') ?>">
 <?php if (!empty($cfg['gsc_verify'])): ?>
 <meta name="google-site-verification" content="<?= h($cfg['gsc_verify']) ?>">
 <?php endif; ?>
@@ -86,6 +86,7 @@ $cfg = cfg();
       <p class="sub">// human things hiding in the source of the open web</p>
       <nav class="nav">
         <a class="<?= $nav === 'home' ? 'on' : '' ?>" href="/">[ loot ]</a>
+        <a class="<?= $nav === 'search' ? 'on' : '' ?>" href="/search">[ search ]</a>
         <a class="<?= $nav === 'archive' ? 'on' : '' ?>" href="/archive">[ archive ]</a>
         <a class="<?= $nav === 'stats' ? 'on' : '' ?>" href="/stats.php">[ stats ]</a>
         <a class="<?= $nav === 'about' ? 'on' : '' ?>" href="/about.php">[ about ]</a>

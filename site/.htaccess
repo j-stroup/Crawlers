@@ -19,6 +19,9 @@ RewriteRule ^sitemap\.xml$ sitemap.php [L]
 RewriteRule ^archive/?$ archive.php [L]
 RewriteRule ^archive/([0-9]+)/?$ archive.php?p=$1 [L]
 
+# Search: /search?q=... (QSA keeps the query string)
+RewriteRule ^search/?$ search.php [L,QSA]
+
 # Never serve the likes database (or its temp files) over the web - it's
 # read server-side by PHP only. Without this, anyone could download
 # data/votes.sqlite directly.
