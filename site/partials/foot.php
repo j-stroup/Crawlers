@@ -5,6 +5,7 @@
     <p>// found your site here and would like it removed?
        <a href="mailto:<?= h(cfg()['contact']) ?>">drop a line</a> and it's gone.</p>
     <p>// <a href="/feed.xml">rss</a> &middot; <a href="/stats.php">the numbers</a> &middot; follow the loot as it's found.</p>
+    <p>// made by <a href="https://stroupphoto.com" target="_blank" rel="noopener">u9ly</a> &middot; <a href="https://stroupphoto.com" target="_blank" rel="noopener">more experiments &raquo;</a></p>
   </footer>
 </div>
 <!-- the "close" egg: the red dot doesn't close v0rt, it powers up a terminal -->
